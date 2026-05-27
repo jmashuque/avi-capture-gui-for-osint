@@ -39,9 +39,17 @@ The app provides a guided interface for:
 - choosing an input URL file or pasting URLs directly
 - setting a case name and output folder
 - selecting a cookies file when needed
+- optionally deleting the selected cookies file when the GUI exits
 - selecting an FFmpeg folder
-- choosing a supported impersonation target
-- checking the selected VPN/network adapter status
+- choosing a supported impersonation target, with an option to show all returned yt-dlp targets
+- choosing capture options such as max resolution, archive mode, date filters, source scope, and sidecar artifacts
+- configuring advanced filters such as match/reject title keywords, failure handling, and request pacing
+- browsing output root case folders in a separate case browser window
+- viewing generated GUI thumbnails for captured videos when FFmpeg is available
+- viewing cached video/audio media details through case browser cards and tooltips
+- opening selected folders, captured media, and sidecar files from the case browser
+- single-clicking folders to expand them and show their contents in the case browser
+- optionally checking the selected VPN/network adapter status
 - running a preflight check before capture
 - starting and stopping the capture workflow
 - opening the current case folder
@@ -118,13 +126,17 @@ Resetting defaults only resets the Default profile. It does not remove custom pr
 
 ## Cookies Handling
 
-The app can reference a cookies file and includes helper options to export, encrypt, or decrypt cookies files.
+The app can reference a cookies file and includes helper options to export, encrypt, decrypt, or delete the selected cookies file on exit.
 
 Cookies files should be treated as sensitive. A raw cookies file may function like a browser session and should not be shared or stored casually.
 
 For storage or transfer, use the app's encrypted cookies option or follow the organization's approved secure handling process.
 
 The app does not display cookie contents in the GUI.
+
+The **Delete Cookies on Exit** setting is stored as an app-level setting, not a profile setting. When enabled, the app attempts to delete the file currently shown in the Cookies File field when the GUI closes.
+
+The **Check VPN** setting is also stored as an app-level setting, not a profile setting. When disabled, the VPN Status section is hidden, the VPN-related Tools menu actions are disabled, and capture start does not warn if the VPN is not connected.
 
 ## Limitations
 
@@ -134,20 +146,67 @@ The VPN check only confirms whether the selected adapter is up. It does not prov
 
 The preflight check confirms common prerequisites, but it cannot guarantee that every target URL will be accessible or capturable.
 
+The case browser uses FFmpeg to generate PNG thumbnails in a `.gui-cache` folder. It also uses FFprobe to cache media information such as duration, size, codec, resolution, frame rate, and audio details. If FFmpeg or FFprobe is unavailable, the app displays fallback placeholders and unavailable media details instead.
+
 The app is only a workflow wrapper. It does not make authorization, policy, or legal decisions.
 
 ## Changelog
 
-### v0.2026.0526 - PowerShell Capture, yt-dlp Updates, and Capture Options
+### v0.2026.0527 - Advanced Capture, App Settings, and Case Browser
 
-#### PowerShell Script Changes
+#### Capture Options and Advanced Options
 
-- Added support for the new GUI capture options.
-- Added switches for MP4 preference, metadata-only capture, playlist inclusion, metadata JSON, source links, descriptions, thumbnails, subtitles, automatic subtitles, and comments.
-- Mapped the new switches to the corresponding `yt-dlp` arguments.
-- Preserved single-item capture by default unless playlist or multi-item capture is explicitly selected.
-- Added FFmpeg folder support through `yt-dlp`'s FFmpeg location option.
-- Kept yt-dlp updating separate from the PowerShell capture process.
+- Added archive mode controls for using the case download archive, ignoring the archive for a run, or forcing a re-capture.
+- Added date filters for capture date after and date before values.
+- Added max resolution presets.
+- Added playlist metadata capture when playlist or multi-item capture is enabled.
+- Added Windows URL shortcut generation.
+- Added match and reject keyword filters with clear buttons.
+- Added failure handling options to continue after failed URLs or stop on the first failed URL.
+- Moved rate limit controls into the Advanced Options panel.
+- Added keep partial files/fragments on failure.
+- Preserved persistent settings and profile support for the new capture options.
+
+#### PowerShell Capture Script Changes
+
+- Added PowerShell handling for archive mode, date filters, max resolution, playlist metadata, URL shortcuts, keyword filters, failure handling, rate limits, and partial-file retention.
+- Added FFmpeg-driven GUI thumbnail generation at the end of each URL capture, independent of the capture thumbnail checkbox.
+- Added FFprobe-driven media information caching at the end of each URL capture.
+- Fixed single-URL input handling so one pasted URL is treated as one URL instead of being indexed as individual characters.
+- Continued keeping yt-dlp updating separate from the capture script.
+
+#### Case Browser
+
+- Added `Tools > Open Case Browser`.
+- Added a separate case browser window with a folder tree for the selected Output Root.
+- Added media and sidecar file cards for selected folders.
+- Added double-click file opening from the case browser.
+- Added an `Open Folder` button for the selected folder.
+- Added single-click folder behavior that expands the selected tree item and shows its contents.
+- Added FFmpeg-generated PNG thumbnails stored in `.gui-cache\thumbnails`.
+- Added FFprobe-generated media metadata stored in `.gui-cache\metadata`.
+- Added case browser card summaries and hover tooltips with media details such as duration, size, bitrate, codec, resolution, frame rate, audio channels, and sample rate.
+- Added fallback placeholders when thumbnails or media information cannot be generated.
+
+#### Settings and Profiles
+
+- Added app-level `Delete Cookies on Exit` setting under the Settings menu.
+- Added app-level `Check VPN` setting under the Settings menu.
+- Made `Delete Cookies on Exit` and `Check VPN` save to the settings file but not to individual profiles.
+- Made `Check VPN` show or hide the VPN Status section.
+- Made Start Capture skip the VPN warning when `Check VPN` is disabled.
+- Disabled VPN-related Tools menu actions when `Check VPN` is disabled.
+- Changed custom profile saving so saving a custom profile no longer overwrites the Default profile.
+
+#### Impersonate Target Handling
+
+- Added `Show all targets` behavior for impersonate target discovery.
+- Kept the main yt-dlp-supported browser choices visible: `chrome`, `edge`, and `firefox`.
+- Added OS labels beside discovered impersonate targets when available.
+- Filtered yt-dlp log/status lines such as `[info]` from the target list.
+- Preserved Windows-focused target discovery as the default behavior.
+
+### v0.2026.0526 - yt-dlp Update Workflow and Capture Options Foundation
 
 #### yt-dlp Update Changes
 
@@ -158,11 +217,19 @@ The app is only a workflow wrapper. It does not make authorization, policy, or l
 - Added update choices for latest stable, latest nightly, or a selected nightly build from GitHub.
 - Added a warning that very recent nightlies may be blocked by ASR or endpoint protection.
 
-#### Capture Options Changes
+#### Capture Options Foundation
 
 - Replaced the always-visible `Prefer MP4` checkbox with a `Capture Options` button.
 - Moved MP4 preference into the Capture Options panel.
 - Added capture mode options for media capture or metadata/artifacts-only capture.
 - Added source scope options for single-item capture or playlist/multi-item capture.
 - Added sidecar artifact options for metadata JSON, source links, descriptions, thumbnails, subtitles, automatic subtitles, and comments.
-- Added persistent settings and profile support for the new capture options.
+- Added persistent settings and profile support for capture options.
+
+#### PowerShell Capture Script Foundation
+
+- Added support for GUI-driven capture options.
+- Added switches for MP4 preference, metadata-only capture, playlist inclusion, metadata JSON, source links, descriptions, thumbnails, subtitles, automatic subtitles, and comments.
+- Preserved single-item capture by default unless playlist or multi-item capture is explicitly selected.
+- Added FFmpeg folder support through yt-dlp's FFmpeg location option.
+- Kept yt-dlp updating separate from the PowerShell capture process.

@@ -32,6 +32,24 @@ DEFAULTS = {
     "prefer_mp4": False,
     "capture_mode": "media",
     "source_scope": "single",
+    "archive_mode": "use",
+    "max_resolution": "best",
+    "save_playlist_metadata": False,
+    "generate_url_shortcuts": False,
+    "match_keywords": "",
+    "reject_keywords": "",
+    "failure_handling": "continue",
+    "show_all_impersonate_targets": False,
+    "date_after_enabled": False,
+    "date_after_year": "",
+    "date_after_month": "",
+    "date_after_day": "",
+    "date_before_enabled": False,
+    "date_before_year": "",
+    "date_before_month": "",
+    "date_before_day": "",
+    "rate_limit": "normal",
+    "keep_partials": False,
     "write_info_json": True,
     "write_source_link": True,
     "write_description": False,
@@ -40,6 +58,11 @@ DEFAULTS = {
     "write_auto_subs": False,
     "write_comments": False,
     "vpn_adapter_name": "",
+}
+
+APP_SETTINGS_DEFAULTS = {
+    "delete_cookies_on_exit": False,
+    "check_vpn": True,
 }
 
 DEFAULT_IMPERSONATE_TARGETS = ["None", "chrome", "edge", "firefox"]
@@ -58,6 +81,8 @@ last_vpn_status = "unknown"
 adapter_display_map = {}
 settings_store = {}
 profile_menu = None
+case_browser_images = []
+case_browser_file_map = {}
 
 
 def browse_file(var, title="Select file"):
@@ -96,7 +121,58 @@ def normalize_impersonate_target(value):
     value = value.strip()
     if not value or value.lower() == "none":
         return ""
-    return value.lower()
+
+    # The "Show all targets" list displays the OS beside each target, e.g.
+    # "chrome-124 (windows-10)", but yt-dlp only wants the target token.
+    if " (" in value:
+        value = value.split(" (", 1)[0].strip()
+
+    return value.split()[0].lower()
+
+
+def normalize_capture_date(year, month, day, label):
+    year = str(year).strip()
+    month = str(month).strip()
+    day = str(day).strip()
+
+    if not year and not month and not day:
+        return ""
+
+    if not (year and month and day):
+        raise ValueError(f"{label} date is incomplete. Select year, month, and day.")
+
+    try:
+        date_obj = datetime(int(year), int(month), int(day))
+    except Exception:
+        raise ValueError(f"{label} date is invalid.")
+
+    return date_obj.strftime("%Y%m%d")
+
+
+def get_enabled_capture_dates():
+    date_after = ""
+    date_before = ""
+
+    if date_after_enabled_var.get():
+        date_after = normalize_capture_date(
+            date_after_year_var.get(),
+            date_after_month_var.get(),
+            date_after_day_var.get(),
+            "Date after",
+        )
+
+    if date_before_enabled_var.get():
+        date_before = normalize_capture_date(
+            date_before_year_var.get(),
+            date_before_month_var.get(),
+            date_before_day_var.get(),
+            "Date before",
+        )
+
+    if date_after and date_before and date_after > date_before:
+        raise ValueError("Date after cannot be later than Date before.")
+
+    return date_after, date_before
 
 
 def safe_case_name(name):
@@ -648,6 +724,8 @@ def validate_inputs():
     if not case_name_var.get().strip():
         raise ValueError("Case name cannot be blank.")
 
+    get_enabled_capture_dates()
+
 
 def build_powershell_command():
     input_path = create_url_input_file()
@@ -689,6 +767,57 @@ def build_powershell_command():
 
     if source_scope_var.get() == "include_playlist":
         cmd += ["-IncludePlaylist"]
+
+    archive_mode = archive_mode_var.get().strip() or "use"
+    if archive_mode == "ignore":
+        cmd += ["-ArchiveMode", "Ignore"]
+    elif archive_mode == "force":
+        cmd += ["-ArchiveMode", "Force"]
+    else:
+        cmd += ["-ArchiveMode", "Use"]
+
+    max_resolution = max_resolution_var.get().strip() or "best"
+    if max_resolution != "best":
+        cmd += ["-MaxResolution", max_resolution]
+
+    if save_playlist_metadata_var.get():
+        cmd += ["-SavePlaylistMetadata"]
+
+    if generate_url_shortcuts_var.get():
+        cmd += ["-GenerateUrlShortcuts"]
+
+    match_keywords = match_keywords_var.get().strip()
+    if match_keywords:
+        cmd += ["-MatchKeywords", match_keywords]
+
+    reject_keywords = reject_keywords_var.get().strip()
+    if reject_keywords:
+        cmd += ["-RejectKeywords", reject_keywords]
+
+    failure_handling = failure_handling_var.get().strip() or "continue"
+    if failure_handling == "stop":
+        cmd += ["-FailureHandling", "Stop"]
+    else:
+        cmd += ["-FailureHandling", "Continue"]
+
+    date_after, date_before = get_enabled_capture_dates()
+
+    if date_after:
+        cmd += ["-DateAfter", date_after]
+
+    if date_before:
+        cmd += ["-DateBefore", date_before]
+
+    rate_limit = rate_limit_var.get().strip() or "normal"
+    if rate_limit == "fast":
+        cmd += ["-RateLimit", "Fast"]
+    elif rate_limit == "cautious":
+        cmd += ["-RateLimit", "Cautious"]
+    else:
+        cmd += ["-RateLimit", "Normal"]
+
+    if keep_partials_var.get():
+        cmd += ["-KeepPartials"]
 
     if write_info_json_var.get():
         cmd += ["-WriteInfoJson"]
@@ -803,8 +932,17 @@ def preflight_check(show_success_popup=True):
 
 
 def run_preflight_check():
-    preflight_check(show_success_popup=True)
-    preflight_done_var.set(True)
+    preflight_done_var.set(False)
+
+    try:
+        passed = preflight_check(show_success_popup=True)
+    except Exception as e:
+        set_status("Preflight failed")
+        append_log(f"\nPreflight error: {e}\n")
+        messagebox.showerror("Preflight failed", str(e))
+        return
+
+    preflight_done_var.set(passed is True)
 
 
 def get_settings_dict():
@@ -820,6 +958,24 @@ def get_settings_dict():
         "prefer_mp4": prefer_mp4_var.get(),
         "capture_mode": capture_mode_var.get(),
         "source_scope": source_scope_var.get(),
+        "archive_mode": archive_mode_var.get(),
+        "max_resolution": max_resolution_var.get(),
+        "save_playlist_metadata": save_playlist_metadata_var.get(),
+        "generate_url_shortcuts": generate_url_shortcuts_var.get(),
+        "match_keywords": match_keywords_var.get(),
+        "reject_keywords": reject_keywords_var.get(),
+        "failure_handling": failure_handling_var.get(),
+        "show_all_impersonate_targets": show_all_impersonate_targets_var.get(),
+        "date_after_enabled": date_after_enabled_var.get(),
+        "date_after_year": date_after_year_var.get(),
+        "date_after_month": date_after_month_var.get(),
+        "date_after_day": date_after_day_var.get(),
+        "date_before_enabled": date_before_enabled_var.get(),
+        "date_before_year": date_before_year_var.get(),
+        "date_before_month": date_before_month_var.get(),
+        "date_before_day": date_before_day_var.get(),
+        "rate_limit": rate_limit_var.get(),
+        "keep_partials": keep_partials_var.get(),
         "write_info_json": write_info_json_var.get(),
         "write_source_link": write_source_link_var.get(),
         "write_description": write_description_var.get(),
@@ -843,6 +999,24 @@ def apply_settings_dict(settings):
     prefer_mp4_var.set(bool(settings.get("prefer_mp4", DEFAULTS["prefer_mp4"])))
     capture_mode_var.set(settings.get("capture_mode", DEFAULTS["capture_mode"]))
     source_scope_var.set(settings.get("source_scope", DEFAULTS["source_scope"]))
+    archive_mode_var.set(settings.get("archive_mode", DEFAULTS["archive_mode"]))
+    max_resolution_var.set(settings.get("max_resolution", DEFAULTS["max_resolution"]))
+    save_playlist_metadata_var.set(bool(settings.get("save_playlist_metadata", DEFAULTS["save_playlist_metadata"])))
+    generate_url_shortcuts_var.set(bool(settings.get("generate_url_shortcuts", DEFAULTS["generate_url_shortcuts"])))
+    match_keywords_var.set(settings.get("match_keywords", DEFAULTS["match_keywords"]))
+    reject_keywords_var.set(settings.get("reject_keywords", DEFAULTS["reject_keywords"]))
+    failure_handling_var.set(settings.get("failure_handling", DEFAULTS["failure_handling"]))
+    show_all_impersonate_targets_var.set(bool(settings.get("show_all_impersonate_targets", DEFAULTS["show_all_impersonate_targets"])))
+    date_after_enabled_var.set(bool(settings.get("date_after_enabled", DEFAULTS["date_after_enabled"])))
+    date_after_year_var.set(settings.get("date_after_year", DEFAULTS["date_after_year"]))
+    date_after_month_var.set(settings.get("date_after_month", DEFAULTS["date_after_month"]))
+    date_after_day_var.set(settings.get("date_after_day", DEFAULTS["date_after_day"]))
+    date_before_enabled_var.set(bool(settings.get("date_before_enabled", DEFAULTS["date_before_enabled"])))
+    date_before_year_var.set(settings.get("date_before_year", DEFAULTS["date_before_year"]))
+    date_before_month_var.set(settings.get("date_before_month", DEFAULTS["date_before_month"]))
+    date_before_day_var.set(settings.get("date_before_day", DEFAULTS["date_before_day"]))
+    rate_limit_var.set(settings.get("rate_limit", DEFAULTS["rate_limit"]))
+    keep_partials_var.set(bool(settings.get("keep_partials", DEFAULTS["keep_partials"])))
     write_info_json_var.set(bool(settings.get("write_info_json", DEFAULTS["write_info_json"])))
     write_source_link_var.set(bool(settings.get("write_source_link", DEFAULTS["write_source_link"])))
     write_description_var.set(bool(settings.get("write_description", DEFAULTS["write_description"])))
@@ -858,6 +1032,121 @@ def make_default_profile_settings():
     data = DEFAULTS.copy()
     data["case_name"] = datetime.now().strftime("Case-%Y-%m-%d")
     return data
+
+
+def get_app_settings_dict():
+    return {
+        "delete_cookies_on_exit": delete_cookies_on_exit_var.get(),
+        "check_vpn": check_vpn_var.get(),
+    }
+
+
+def apply_app_settings_dict(settings):
+    settings = settings if isinstance(settings, dict) else {}
+    delete_cookies_on_exit_var.set(
+        bool(settings.get("delete_cookies_on_exit", APP_SETTINGS_DEFAULTS["delete_cookies_on_exit"]))
+    )
+    check_vpn_var.set(
+        bool(settings.get("check_vpn", APP_SETTINGS_DEFAULTS["check_vpn"]))
+    )
+    update_vpn_section_visibility()
+
+
+def ensure_app_settings_store(store):
+    if not isinstance(store, dict):
+        store = {}
+
+    if not isinstance(store.get("app_settings"), dict):
+        store["app_settings"] = APP_SETTINGS_DEFAULTS.copy()
+    else:
+        merged = APP_SETTINGS_DEFAULTS.copy()
+        merged.update(store["app_settings"])
+        store["app_settings"] = merged
+
+    return store
+
+
+def log_app_settings_status():
+    delete_state = "enabled" if delete_cookies_on_exit_var.get() else "disabled"
+    vpn_state = "enabled" if check_vpn_var.get() else "disabled"
+    append_log(f"Delete cookies on exit: {delete_state}\n")
+    append_log(f"Check VPN: {vpn_state}\n")
+
+
+def save_app_settings(show_popup=False):
+    store = ensure_settings_store()
+    store = ensure_app_settings_store(store)
+    store["app_settings"] = get_app_settings_dict()
+    store["version"] = 2
+
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(store, f, indent=2)
+
+        append_log(f"\nApp settings saved to: {SETTINGS_FILE}\n")
+
+        if show_popup:
+            messagebox.showinfo("Settings saved", f"Settings saved to:\n\n{SETTINGS_FILE}")
+
+        return True
+    except Exception as e:
+        messagebox.showerror("Save failed", f"Could not save app settings:\n\n{e}")
+        return False
+
+
+def update_vpn_tools_menu_state():
+    try:
+        state = "normal" if check_vpn_var.get() else "disabled"
+        tools_menu.entryconfig("Refresh VPN Adapters", state=state)
+        tools_menu.entryconfig("Check VPN", state=state)
+    except Exception:
+        # The app setting can be loaded before the Tools menu exists during startup.
+        pass
+
+
+def update_vpn_section_visibility():
+    try:
+        if check_vpn_var.get():
+            vpn_frame.grid()
+        else:
+            vpn_frame.grid_remove()
+            vpn_status_var.set("VPN: Check disabled")
+    except Exception:
+        # The app setting can be loaded before the VPN frame exists during startup.
+        pass
+
+    update_vpn_tools_menu_state()
+
+
+def toggle_check_vpn_setting():
+    update_vpn_section_visibility()
+    save_app_settings(show_popup=False)
+
+
+def delete_selected_cookies_file_on_exit():
+    cookies_path = cookies_file_var.get().strip()
+
+    if not delete_cookies_on_exit_var.get():
+        append_log("\nDelete cookies on exit is disabled. Cookies file was not deleted.\n")
+        return
+
+    if not cookies_path:
+        append_log("\nDelete cookies on exit is enabled, but the Cookies File field is blank.\n")
+        return
+
+    if not os.path.isfile(cookies_path):
+        append_log(f"\nDelete cookies on exit is enabled, but the cookies file was not found:\n{cookies_path}\n")
+        return
+
+    try:
+        os.remove(cookies_path)
+        append_log(f"\nDeleted cookies file on exit:\n{cookies_path}\n")
+    except Exception as e:
+        append_log(f"\nFailed to delete cookies file on exit:\n{cookies_path}\nError: {e}\n")
+        messagebox.showwarning(
+            "Cookies file not deleted",
+            f"Delete cookies on exit is enabled, but the cookies file could not be deleted:\n\n{cookies_path}\n\n{e}",
+        )
 
 
 def normalize_settings_store(raw):
@@ -882,10 +1171,13 @@ def normalize_settings_store(raw):
     if DEFAULT_PROFILE_NAME not in clean_profiles:
         clean_profiles[DEFAULT_PROFILE_NAME] = make_default_profile_settings()
 
-    return {
+    app_settings = raw.get("app_settings", {}) if isinstance(raw, dict) else {}
+
+    return ensure_app_settings_store({
         "version": 2,
         "profiles": clean_profiles,
-    }
+        "app_settings": app_settings,
+    })
 
 
 def ensure_settings_store():
@@ -904,6 +1196,8 @@ def ensure_settings_store():
 
     if DEFAULT_PROFILE_NAME not in settings_store["profiles"]:
         settings_store["profiles"][DEFAULT_PROFILE_NAME] = get_settings_dict()
+
+    settings_store = ensure_app_settings_store(settings_store)
 
     return settings_store
 
@@ -957,6 +1251,7 @@ def save_settings(show_popup=True, path=None):
         # the Default profile. Custom profiles are only changed through the
         # Profile menu's explicit save command.
         store["profiles"][DEFAULT_PROFILE_NAME] = get_settings_dict()
+        store["app_settings"] = get_app_settings_dict()
         store["version"] = 2
 
         with open(settings_path, "w", encoding="utf-8") as f:
@@ -1004,8 +1299,11 @@ def load_settings(show_popup=True, startup=False, path=None):
             "profiles": {
                 DEFAULT_PROFILE_NAME: make_default_profile_settings(),
             },
+            "app_settings": APP_SETTINGS_DEFAULTS.copy(),
         }
+        apply_app_settings_dict(settings_store["app_settings"])
         append_log(f"Settings file not found. Using defaults.\nExpected path: {settings_path}\n")
+        log_app_settings_status()
         rebuild_profile_menu()
         return False
 
@@ -1014,6 +1312,7 @@ def load_settings(show_popup=True, startup=False, path=None):
             raw = json.load(f)
 
         settings_store = normalize_settings_store(raw)
+        apply_app_settings_dict(settings_store.get("app_settings", {}))
 
         # The default profile is always the profile loaded at app startup and
         # when a settings file is loaded.
@@ -1024,6 +1323,7 @@ def load_settings(show_popup=True, startup=False, path=None):
 
         append_log(f"Settings loaded from: {settings_path}\n")
         append_log(f"Loaded {len(settings_store['profiles'])} profile(s). Active profile: {DEFAULT_PROFILE_NAME}\n")
+        log_app_settings_status()
 
         if show_popup and not startup:
             messagebox.showinfo(
@@ -1041,8 +1341,11 @@ def load_settings(show_popup=True, startup=False, path=None):
             "profiles": {
                 DEFAULT_PROFILE_NAME: make_default_profile_settings(),
             },
+            "app_settings": APP_SETTINGS_DEFAULTS.copy(),
         }
+        apply_app_settings_dict(settings_store["app_settings"])
         append_log(f"Settings file was found but could not be loaded. Using defaults.\nError: {e}\n")
+        log_app_settings_status()
 
         if show_popup and not startup:
             messagebox.showerror("Load failed", f"Could not load settings:\n\n{e}")
@@ -1115,17 +1418,22 @@ def save_current_settings_to_profile():
             return
 
     store["profiles"][profile_name] = get_settings_dict()
+    store["app_settings"] = get_app_settings_dict()
+    store["version"] = 2
     selected_profile_var.set(profile_name)
     update_window_title()
 
-    # This writes all profiles to the default portable settings file. It also
-    # refreshes the Default profile with current GUI settings, while preserving
-    # all custom profiles.
-    save_settings(show_popup=False)
+    # Saving a custom profile must not refresh or overwrite the Default profile.
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(store, f, indent=2)
 
-    append_log(f"\nProfile saved: {profile_name}\n")
-    messagebox.showinfo("Profile saved", f"Profile saved:\n\n{profile_name}")
-    rebuild_profile_menu()
+        append_log(f"\nProfile saved: {profile_name}\n")
+        append_log(f"Settings saved to: {SETTINGS_FILE}\n")
+        messagebox.showinfo("Profile saved", f"Profile saved:\n\n{profile_name}")
+        rebuild_profile_menu()
+    except Exception as e:
+        messagebox.showerror("Save failed", f"Could not save profile:\n\n{e}")
 
 
 def delete_selected_profile():
@@ -1175,7 +1483,11 @@ def reset_defaults():
     selected_profile_var.set(DEFAULT_PROFILE_NAME)
     update_window_title()
 
+    delete_cookies_on_exit_var.set(APP_SETTINGS_DEFAULTS["delete_cookies_on_exit"])
+    check_vpn_var.set(APP_SETTINGS_DEFAULTS["check_vpn"])
+    update_vpn_section_visibility()
     store["profiles"][DEFAULT_PROFILE_NAME] = get_settings_dict()
+    store["app_settings"] = get_app_settings_dict()
     save_settings(show_popup=False)
 
     append_log("\nReset GUI fields to defaults and overwrote only the Default profile. Custom profiles were preserved.\n")
@@ -1197,7 +1509,7 @@ def start_capture():
         messagebox.showerror("Input error", str(e))
         return
 
-    if last_vpn_status != "connected":
+    if check_vpn_var.get() and last_vpn_status != "connected":
         proceed = messagebox.askyesno(
             "VPN not connected",
             "The VPN does not appear to be connected.\n\n"
@@ -1330,6 +1642,11 @@ def get_selected_vpn_adapter_identifiers():
 
 def check_vpn_status():
     global last_vpn_status
+
+    if not check_vpn_var.get():
+        last_vpn_status = "disabled"
+        vpn_status_var.set("VPN: Check disabled")
+        return
 
     selected_adapter = get_selected_vpn_adapter_identifiers()
     selected_name = selected_adapter.get("name", "").replace("'", "''")
@@ -1908,22 +2225,65 @@ def check_impersonate_targets():
                 part for part in [result.stdout, result.stderr] if part
             )
 
-            targets = parse_windows_impersonate_targets(combined_output)
+            if show_all_impersonate_targets_var.get():
+                targets = parse_all_impersonate_targets(combined_output)
+                target_label = "target(s)"
+                log_title = "Available impersonate targets"
+            else:
+                targets = parse_windows_impersonate_targets(combined_output)
+                target_label = "Windows target(s)"
+                log_title = "Available Windows impersonate targets"
 
             values = DEFAULT_IMPERSONATE_TARGETS.copy()
             for target in targets:
-                if target not in values:
+                if is_valid_impersonate_target_label(target) and target not in values:
                     values.append(target)
 
             root.after(0, update_impersonate_menu, values)
-            root.after(0, target_status_var.set, f"Impersonate targets: Found {len(values) - 1} Windows target(s)")
-            root.after(0, append_log, "\nAvailable Windows impersonate targets:\n" + "\n".join(values) + "\n")
+            root.after(0, target_status_var.set, f"Impersonate targets: Found {len(values) - 1} {target_label}")
+            root.after(0, append_log, f"\n{log_title}:\n" + "\n".join(values) + "\n")
 
         except Exception as e:
             root.after(0, target_status_var.set, "Impersonate targets: Check failed")
             root.after(0, messagebox.showerror, "Impersonate check failed", str(e))
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+def is_valid_impersonate_target_label(value):
+    value = (value or "").strip()
+
+    if not value:
+        return False
+
+    lowered = value.lower()
+
+    # Filter yt-dlp status/log lines such as [info], [debug], [warning], etc.
+    if lowered.startswith("["):
+        return False
+
+    target_token = normalize_impersonate_target(value)
+
+    if not target_token:
+        return False
+
+    if target_token.startswith("["):
+        return False
+
+    if target_token in {"target", "client", "source", "os", "none"}:
+        return False
+
+    browser_prefixes = (
+        "chrome",
+        "edge",
+        "firefox",
+        "brave",
+        "opera",
+        "vivaldi",
+        "safari",
+    )
+
+    return target_token.startswith(browser_prefixes)
 
 
 def parse_windows_impersonate_targets(output):
@@ -1947,7 +2307,7 @@ def parse_windows_impersonate_targets(output):
 
         lowered = line.lower()
 
-        if lowered.startswith("[debug]"):
+        if lowered.startswith("["):
             continue
 
         if "client" in lowered and "os" in lowered:
@@ -1978,11 +2338,100 @@ def parse_windows_impersonate_targets(output):
     return targets
 
 
+def parse_all_impersonate_targets(output):
+    targets = []
+    seen = set()
+
+    browser_prefixes = (
+        "chrome",
+        "edge",
+        "firefox",
+        "brave",
+        "opera",
+        "vivaldi",
+        "safari",
+    )
+
+    os_tokens = (
+        "windows",
+        "win",
+        "macos",
+        "mac",
+        "linux",
+        "ubuntu",
+        "android",
+        "ios",
+        "iphone",
+        "ipad",
+    )
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        lowered = line.lower()
+
+        # Skip yt-dlp log/info/debug lines. These are not impersonation targets.
+        if lowered.startswith("["):
+            continue
+
+        if "client" in lowered and "os" in lowered:
+            continue
+
+        if "target" in lowered and "source" in lowered:
+            continue
+
+        if set(line) <= {"-", " ", "\t"}:
+            continue
+
+        parts = line.split()
+        if not parts:
+            continue
+
+        candidate = parts[0].strip().lower()
+
+        if candidate.startswith("["):
+            continue
+
+        if not candidate.startswith(browser_prefixes):
+            continue
+
+        os_value = ""
+
+        for part in parts[1:]:
+            clean_part = part.strip().strip("|").strip(",").strip().lower()
+            if any(token in clean_part for token in os_tokens):
+                os_value = clean_part
+                break
+
+        display = f"{candidate} ({os_value})" if os_value else candidate
+
+        # De-duplicate by the display label so the same target can be shown
+        # separately for different OS values if yt-dlp reports it that way.
+        if display not in seen:
+            seen.add(display)
+            targets.append(display)
+
+    return targets
+
+
 def update_impersonate_menu(values):
-    impersonate_menu["values"] = values
+    clean_values = []
+
+    for value in values:
+        if value == "None" or is_valid_impersonate_target_label(value):
+            if value not in clean_values:
+                clean_values.append(value)
+
+    if "None" not in clean_values:
+        clean_values.insert(0, "None")
+
+    impersonate_menu["values"] = clean_values
 
     current = impersonate_var.get()
-    if current not in values:
+    if current not in clean_values:
         impersonate_var.set("None")
 
 
@@ -2244,6 +2693,23 @@ def update_capture_options_summary(*args):
     try:
         mode = "Metadata only" if capture_mode_var.get() == "metadata_only" else "Media + artifacts"
         scope = "Include playlist" if source_scope_var.get() == "include_playlist" else "Single item"
+
+        archive_names = {
+            "use": "case archive",
+            "ignore": "ignore archive",
+            "force": "force re-capture",
+        }
+        archive_text = archive_names.get(archive_mode_var.get(), "case archive")
+
+        rate_names = {
+            "fast": "fast",
+            "normal": "normal",
+            "cautious": "cautious",
+        }
+        rate_text = rate_names.get(rate_limit_var.get(), "normal")
+        resolution_text = "best" if max_resolution_var.get() == "best" else f"max {max_resolution_var.get()}p"
+        failure_text = "stop on fail" if failure_handling_var.get() == "stop" else "continue on fail"
+
         artifacts = []
 
         if write_info_json_var.get():
@@ -2262,38 +2728,836 @@ def update_capture_options_summary(*args):
             artifacts.append("comments")
         if prefer_mp4_var.get():
             artifacts.append("MP4")
+        if save_playlist_metadata_var.get() and source_scope_var.get() == "include_playlist":
+            artifacts.append("playlist metadata")
+        if generate_url_shortcuts_var.get():
+            artifacts.append("URL shortcuts")
+        if keep_partials_var.get():
+            artifacts.append("partials")
+
+        date_filters = []
+        if date_after_enabled_var.get():
+            date_filters.append("after")
+        if date_before_enabled_var.get():
+            date_filters.append("before")
+
+        if date_filters:
+            artifacts.append("date " + "/".join(date_filters))
 
         artifact_text = ", ".join(artifacts) if artifacts else "no sidecars"
-        capture_options_summary_var.set(f"{mode}; {scope}; {artifact_text}")
+        capture_options_summary_var.set(f"{mode}; {scope}; {archive_text}; {resolution_text}; {rate_text}; {failure_text}; {artifact_text}")
     except Exception:
         pass
 
 
+def hide_capture_options_panel(save=False):
+    try:
+        if capture_options_panel.winfo_ismapped():
+            capture_options_panel.grid_remove()
+    except Exception:
+        pass
+
+    capture_options_button.config(text="Capture Options ▾")
+
+    if save:
+        update_capture_options_summary()
+        save_settings(show_popup=False)
+
+
+def hide_advanced_options_panel(save=False):
+    try:
+        if advanced_options_panel.winfo_ismapped():
+            advanced_options_panel.grid_remove()
+    except Exception:
+        pass
+
+    advanced_options_button.config(text="Advanced Options ▾")
+
+    if save:
+        update_capture_options_summary()
+        save_settings(show_popup=False)
+
+
 def toggle_capture_options_panel():
     if capture_options_panel.winfo_ismapped():
-        capture_options_panel.grid_remove()
-        capture_options_button.config(text="Capture Options ▾")
-        save_settings(show_popup=False)
-    else:
-        update_capture_options_summary()
-        capture_options_panel.grid(
-            row=10,
-            column=0,
-            columnspan=3,
-            rowspan=8,
-            sticky="nsew",
-            padx=0,
-            pady=(8, 0),
-        )
-        capture_options_panel.tkraise()
-        capture_options_button.config(text="Capture Options ▴")
+        hide_capture_options_panel(save=True)
+        return
+
+    hide_advanced_options_panel(save=True)
+    update_capture_options_summary()
+    capture_options_panel.grid(
+        row=10,
+        column=0,
+        columnspan=3,
+        rowspan=8,
+        sticky="nsew",
+        padx=0,
+        pady=(8, 0),
+    )
+    capture_options_panel.tkraise()
+    capture_options_button.config(text="Capture Options ▴")
 
 
 def close_capture_options_panel():
-    capture_options_panel.grid_remove()
-    capture_options_button.config(text="Capture Options ▾")
+    hide_capture_options_panel(save=True)
+
+
+def update_playlist_metadata_visibility(*args):
+    try:
+        if source_scope_var.get() == "include_playlist":
+            playlist_metadata_check.grid()
+        else:
+            save_playlist_metadata_var.set(False)
+            playlist_metadata_check.grid_remove()
+    except Exception:
+        pass
+
     update_capture_options_summary()
-    save_settings(show_popup=False)
+
+
+def toggle_advanced_options_panel():
+    if advanced_options_panel.winfo_ismapped():
+        hide_advanced_options_panel(save=True)
+        return
+
+    hide_capture_options_panel(save=True)
+    update_capture_options_summary()
+    advanced_options_panel.grid(
+        row=10,
+        column=0,
+        columnspan=3,
+        rowspan=8,
+        sticky="nsew",
+        padx=0,
+        pady=(8, 0),
+    )
+    advanced_options_panel.tkraise()
+    advanced_options_button.config(text="Advanced Options ▴")
+
+
+def close_advanced_options_panel():
+    hide_advanced_options_panel(save=True)
+
+
+def clear_match_keywords():
+    match_keywords_var.set("")
+    update_capture_options_summary()
+
+
+def clear_reject_keywords():
+    reject_keywords_var.set("")
+    update_capture_options_summary()
+
+
+
+def get_ffmpeg_executable_for_gui():
+    ffmpeg_folder = ffmpeg_folder_var.get().strip()
+
+    if ffmpeg_folder:
+        candidate = os.path.join(ffmpeg_folder, "ffmpeg.exe")
+        if os.path.isfile(candidate):
+            return candidate
+
+    found = shutil.which("ffmpeg.exe") or shutil.which("ffmpeg")
+    return found or ""
+
+
+def get_gui_thumbnail_cache_folder_for_path(path):
+    output_root = output_root_var.get().strip()
+    current = os.path.abspath(path)
+
+    try:
+        output_root_abs = os.path.abspath(output_root)
+    except Exception:
+        output_root_abs = ""
+
+    case_root = ""
+
+    if output_root_abs and os.path.commonpath([output_root_abs, current]) == output_root_abs:
+        rel = os.path.relpath(current, output_root_abs)
+        first_part = rel.split(os.sep)[0]
+        if first_part and first_part not in (".", ".."):
+            case_root = os.path.join(output_root_abs, first_part)
+
+    if not case_root:
+        case_root = os.path.dirname(current)
+
+    return os.path.join(case_root, ".gui-cache", "thumbnails")
+
+
+def get_gui_thumbnail_path(video_path):
+    cache_folder = get_gui_thumbnail_cache_folder_for_path(video_path)
+    try:
+        file_hash = hashlib.sha256()
+        with open(video_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                file_hash.update(chunk)
+        thumb_name = f"{file_hash.hexdigest().upper()}.png"
+    except Exception:
+        thumb_name = hashlib.sha256(os.path.abspath(video_path).encode("utf-8", errors="ignore")).hexdigest().upper() + ".png"
+
+    return os.path.join(cache_folder, thumb_name)
+
+
+def generate_gui_thumbnail(video_path):
+    thumb_path = get_gui_thumbnail_path(video_path)
+
+    if os.path.isfile(thumb_path):
+        return thumb_path
+
+    ffmpeg_exe = get_ffmpeg_executable_for_gui()
+    if not ffmpeg_exe:
+        return ""
+
+    try:
+        os.makedirs(os.path.dirname(thumb_path), exist_ok=True)
+
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            "00:00:03",
+            "-i",
+            video_path,
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=320:-1",
+            thumb_path,
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+
+        if result.returncode == 0 and os.path.isfile(thumb_path):
+            return thumb_path
+
+        if os.path.isfile(thumb_path):
+            try:
+                os.remove(thumb_path)
+            except Exception:
+                pass
+
+        return ""
+
+    except Exception:
+        return ""
+
+
+def get_ffprobe_executable_for_gui():
+    ffmpeg_folder = ffmpeg_folder_var.get().strip()
+
+    if ffmpeg_folder:
+        candidate = os.path.join(ffmpeg_folder, "ffprobe.exe")
+        if os.path.isfile(candidate):
+            return candidate
+
+    found = shutil.which("ffprobe.exe") or shutil.which("ffprobe")
+    return found or ""
+
+
+def get_gui_metadata_path(media_path):
+    cache_folder = get_gui_thumbnail_cache_folder_for_path(media_path)
+    metadata_folder = os.path.join(os.path.dirname(cache_folder), "metadata")
+
+    try:
+        file_hash = hashlib.sha256()
+        with open(media_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                file_hash.update(chunk)
+        metadata_name = f"{file_hash.hexdigest().upper()}.ffprobe.json"
+    except Exception:
+        metadata_name = hashlib.sha256(os.path.abspath(media_path).encode("utf-8", errors="ignore")).hexdigest().upper() + ".ffprobe.json"
+
+    return os.path.join(metadata_folder, metadata_name)
+
+
+def load_or_generate_media_info(media_path):
+    metadata_path = get_gui_metadata_path(media_path)
+
+    if os.path.isfile(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    ffprobe_exe = get_ffprobe_executable_for_gui()
+    if not ffprobe_exe:
+        return {}
+
+    try:
+        os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+
+        cmd = [
+            ffprobe_exe,
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            media_path,
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+
+        if result.returncode != 0 or not result.stdout.strip():
+            return {}
+
+        info = json.loads(result.stdout)
+
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(info, f, indent=2)
+
+        return info
+
+    except Exception:
+        return {}
+
+
+def format_seconds_for_display(value):
+    try:
+        total_seconds = int(float(value))
+    except Exception:
+        return ""
+
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+
+    return f"{minutes}:{seconds:02d}"
+
+
+def format_bytes_for_display(value):
+    try:
+        size = float(value)
+    except Exception:
+        return ""
+
+    units = ["B", "KB", "MB", "GB", "TB"]
+    unit_index = 0
+
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+
+    if unit_index == 0:
+        return f"{int(size)} {units[unit_index]}"
+
+    return f"{size:.1f} {units[unit_index]}"
+
+
+def format_bitrate_for_display(value):
+    try:
+        bitrate = float(value)
+    except Exception:
+        return ""
+
+    if bitrate >= 1_000_000:
+        return f"{bitrate / 1_000_000:.2f} Mbps"
+
+    if bitrate >= 1_000:
+        return f"{bitrate / 1_000:.0f} kbps"
+
+    return f"{bitrate:.0f} bps"
+
+
+def get_streams_by_type(info, stream_type):
+    streams = info.get("streams", []) if isinstance(info, dict) else []
+    return [stream for stream in streams if stream.get("codec_type") == stream_type]
+
+
+def get_media_info_summary(info, file_path):
+    if not info:
+        return {
+            "card": "Media info unavailable",
+            "tooltip": f"{os.path.basename(file_path)}\n\nMedia information unavailable.\nFFprobe may be missing or unable to read this file.",
+        }
+
+    format_info = info.get("format", {}) if isinstance(info, dict) else {}
+    video_streams = get_streams_by_type(info, "video")
+    audio_streams = get_streams_by_type(info, "audio")
+
+    duration = format_seconds_for_display(format_info.get("duration"))
+    size = format_bytes_for_display(format_info.get("size"))
+    bitrate = format_bitrate_for_display(format_info.get("bit_rate"))
+
+    card_lines = []
+
+    if video_streams:
+        video = video_streams[0]
+        width = video.get("width")
+        height = video.get("height")
+        codec = video.get("codec_name", "video")
+
+        if width and height:
+            card_lines.append(f"{width}x{height}")
+
+        if codec:
+            card_lines.append(str(codec))
+
+    elif audio_streams:
+        audio = audio_streams[0]
+        codec = audio.get("codec_name", "audio")
+        card_lines.append(str(codec))
+
+    if duration:
+        card_lines.append(duration)
+
+    if size:
+        card_lines.append(size)
+
+    if not card_lines:
+        card_lines.append("Media file")
+
+    tooltip_lines = [
+        os.path.basename(file_path),
+        "",
+    ]
+
+    if duration:
+        tooltip_lines.append(f"Duration: {duration}")
+    if size:
+        tooltip_lines.append(f"Size: {size}")
+    if bitrate:
+        tooltip_lines.append(f"Overall bitrate: {bitrate}")
+
+    if video_streams:
+        video = video_streams[0]
+        width = video.get("width")
+        height = video.get("height")
+        codec = video.get("codec_name", "")
+        profile = video.get("profile", "")
+        pix_fmt = video.get("pix_fmt", "")
+
+        fps = ""
+        rate = video.get("avg_frame_rate") or video.get("r_frame_rate")
+        if rate and "/" in rate:
+            try:
+                num, den = rate.split("/", 1)
+                den = float(den)
+                if den:
+                    fps_value = float(num) / den
+                    if fps_value > 0:
+                        fps = f"{fps_value:.2f} fps"
+            except Exception:
+                pass
+
+        tooltip_lines.append("")
+        tooltip_lines.append("Video:")
+        if width and height:
+            tooltip_lines.append(f"  Resolution: {width}x{height}")
+        if codec:
+            tooltip_lines.append(f"  Codec: {codec}")
+        if profile:
+            tooltip_lines.append(f"  Profile: {profile}")
+        if fps:
+            tooltip_lines.append(f"  Frame rate: {fps}")
+        if pix_fmt:
+            tooltip_lines.append(f"  Pixel format: {pix_fmt}")
+
+    if audio_streams:
+        audio = audio_streams[0]
+        codec = audio.get("codec_name", "")
+        channels = audio.get("channels", "")
+        channel_layout = audio.get("channel_layout", "")
+        sample_rate = audio.get("sample_rate", "")
+
+        tooltip_lines.append("")
+        tooltip_lines.append("Audio:")
+        if codec:
+            tooltip_lines.append(f"  Codec: {codec}")
+        if channels:
+            tooltip_lines.append(f"  Channels: {channels}")
+        if channel_layout:
+            tooltip_lines.append(f"  Layout: {channel_layout}")
+        if sample_rate:
+            tooltip_lines.append(f"  Sample rate: {sample_rate} Hz")
+
+    try:
+        rel_path = os.path.relpath(file_path, output_root_var.get().strip())
+    except Exception:
+        rel_path = file_path
+
+    tooltip_lines.append("")
+    tooltip_lines.append(f"Path: {rel_path}")
+
+    return {
+        "card": " | ".join(card_lines),
+        "tooltip": "\n".join(tooltip_lines),
+    }
+
+
+class Tooltip:
+    def __init__(self, widget, text, delay=500):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self.after_id = None
+        self.window = None
+
+        widget.bind("<Enter>", self.schedule)
+        widget.bind("<Leave>", self.hide)
+        widget.bind("<ButtonPress>", self.hide)
+
+    def schedule(self, event=None):
+        self.cancel()
+        self.after_id = self.widget.after(self.delay, self.show)
+
+    def cancel(self):
+        if self.after_id:
+            try:
+                self.widget.after_cancel(self.after_id)
+            except Exception:
+                pass
+            self.after_id = None
+
+    def show(self):
+        if self.window or not self.text:
+            return
+
+        try:
+            x = self.widget.winfo_rootx() + 20
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 10
+        except Exception:
+            x = 100
+            y = 100
+
+        self.window = tk.Toplevel(self.widget)
+        self.window.wm_overrideredirect(True)
+        self.window.wm_geometry(f"+{x}+{y}")
+
+        label = ttk.Label(
+            self.window,
+            text=self.text,
+            justify="left",
+            relief="solid",
+            borderwidth=1,
+            padding=8,
+            wraplength=520,
+        )
+        label.pack()
+
+    def hide(self, event=None):
+        self.cancel()
+
+        if self.window:
+            try:
+                self.window.destroy()
+            except Exception:
+                pass
+            self.window = None
+
+
+def is_browser_media_file(path):
+    return os.path.splitext(path)[1].lower() in {
+        ".mp4",
+        ".mkv",
+        ".webm",
+        ".mov",
+        ".avi",
+        ".m4v",
+        ".mp3",
+        ".m4a",
+        ".opus",
+        ".wav",
+        ".aac",
+        ".flac",
+    }
+
+
+def is_browser_video_file(path):
+    return os.path.splitext(path)[1].lower() in {
+        ".mp4",
+        ".mkv",
+        ".webm",
+        ".mov",
+        ".avi",
+        ".m4v",
+    }
+
+
+def open_case_browser():
+    output_root = output_root_var.get().strip()
+
+    if not output_root:
+        messagebox.showwarning("Output root missing", "Output Root is blank.")
+        return
+
+    if not os.path.isdir(output_root):
+        messagebox.showwarning("Output root not found", f"Output Root does not exist:\n\n{output_root}")
+        return
+
+    browser = tk.Toplevel(root)
+    browser.title("Case Browser")
+    browser.geometry("1100x720")
+    browser.minsize(900, 560)
+    browser.transient(root)
+
+    browser_file_map = {}
+    tree_path_map = {}
+    image_refs = []
+
+    top_bar = ttk.Frame(browser, padding=8)
+    top_bar.pack(fill="x")
+
+    ttk.Label(top_bar, text=f"Output Root: {output_root}").pack(side="left", fill="x", expand=True)
+
+    paned = ttk.PanedWindow(browser, orient="horizontal")
+    paned.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+    tree_frame = ttk.Frame(paned)
+    tree_frame.columnconfigure(0, weight=1)
+    tree_frame.rowconfigure(0, weight=1)
+
+    tree = ttk.Treeview(tree_frame, show="tree")
+    tree.grid(row=0, column=0, sticky="nsew")
+
+    tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+    tree_scroll.grid(row=0, column=1, sticky="ns")
+    tree.configure(yscrollcommand=tree_scroll.set)
+
+    paned.add(tree_frame, weight=1)
+
+    right_frame = ttk.Frame(paned)
+    right_frame.columnconfigure(0, weight=1)
+    right_frame.rowconfigure(1, weight=1)
+
+    browser_status_var = tk.StringVar(value="Select a folder to view captured files.")
+    ttk.Label(right_frame, textvariable=browser_status_var).grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
+    canvas = tk.Canvas(right_frame, highlightthickness=0)
+    canvas.grid(row=1, column=0, sticky="nsew")
+
+    y_scroll = ttk.Scrollbar(right_frame, orient="vertical", command=canvas.yview)
+    y_scroll.grid(row=1, column=1, sticky="ns")
+    canvas.configure(yscrollcommand=y_scroll.set)
+
+    content_frame = ttk.Frame(canvas)
+    content_window = canvas.create_window((0, 0), window=content_frame, anchor="nw")
+
+    def configure_content(event=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def configure_canvas(event):
+        canvas.itemconfigure(content_window, width=event.width)
+
+    content_frame.bind("<Configure>", configure_content)
+    canvas.bind("<Configure>", configure_canvas)
+
+    paned.add(right_frame, weight=4)
+
+    def insert_folder(parent_id, folder_path, max_depth=4, depth=0):
+        if depth > max_depth:
+            return
+
+        try:
+            entries = [
+                entry for entry in os.scandir(folder_path)
+                if entry.is_dir() and entry.name.lower() not in {".gui-cache", "__pycache__"}
+            ]
+        except Exception:
+            entries = []
+
+        entries.sort(key=lambda entry: entry.name.lower())
+
+        for entry in entries:
+            item_id = tree.insert(parent_id, "end", text=entry.name, open=False)
+            tree_path_map[item_id] = entry.path
+            insert_folder(item_id, entry.path, max_depth=max_depth, depth=depth + 1)
+
+    root_id = tree.insert("", "end", text=os.path.basename(os.path.abspath(output_root)) or output_root, open=True)
+    tree_path_map[root_id] = output_root
+    insert_folder(root_id, output_root)
+
+    def open_selected_file(path):
+        if os.path.isfile(path):
+            os.startfile(path)
+
+    def make_placeholder(parent, extension, width=160, height=100):
+        placeholder = tk.Canvas(parent, width=width, height=height, highlightthickness=1, relief="ridge")
+        placeholder.create_rectangle(0, 0, width, height)
+        placeholder.create_text(width // 2, height // 2 - 8, text=(extension or "FILE").upper(), font=("Segoe UI", 14, "bold"))
+        placeholder.create_text(width // 2, height // 2 + 16, text="No preview", font=("Segoe UI", 9))
+        return placeholder
+
+    def clear_content():
+        for child in content_frame.winfo_children():
+            child.destroy()
+        image_refs.clear()
+
+    def list_display_files(folder_path):
+        display_files = []
+
+        for root_dir, dir_names, file_names in os.walk(folder_path):
+            dir_names[:] = [
+                name for name in dir_names
+                if name.lower() not in {".gui-cache", "__pycache__"}
+            ]
+
+            for file_name in file_names:
+                path = os.path.join(root_dir, file_name)
+                ext = os.path.splitext(file_name)[1].lower()
+
+                if is_browser_media_file(path) or ext in {".json", ".txt", ".description", ".url", ".webloc", ".srt", ".vtt", ".png", ".jpg", ".jpeg", ".webp"}:
+                    display_files.append(path)
+
+        display_files.sort(key=lambda p: (not is_browser_media_file(p), os.path.basename(p).lower()))
+        return display_files
+
+    def render_files(folder_path):
+        clear_content()
+
+        files = list_display_files(folder_path)
+        browser_status_var.set(f"{folder_path} - {len(files)} file(s)")
+
+        if not files:
+            ttk.Label(content_frame, text="No media or sidecar files found in this folder.").grid(row=0, column=0, sticky="w", padx=12, pady=12)
+            return
+
+        columns = 4
+
+        for index, path in enumerate(files):
+            row = index // columns
+            column = index % columns
+
+            card = ttk.Frame(content_frame, padding=8, relief="ridge")
+            card.grid(row=row, column=column, sticky="n", padx=8, pady=8)
+
+            ext = os.path.splitext(path)[1].lower().lstrip(".")
+            thumb_loaded = False
+            info_summary = None
+            tooltip_text = f"{os.path.basename(path)}\n\nDouble-click to open."
+
+            if is_browser_media_file(path):
+                media_info = load_or_generate_media_info(path)
+                info_summary = get_media_info_summary(media_info, path)
+                tooltip_text = info_summary["tooltip"] + "\n\nDouble-click to open."
+
+            if is_browser_video_file(path):
+                thumb_path = generate_gui_thumbnail(path)
+                if thumb_path and os.path.isfile(thumb_path):
+                    try:
+                        image = tk.PhotoImage(file=thumb_path)
+                        if image.width() > 180:
+                            factor = max(1, int(image.width() / 160))
+                            image = image.subsample(factor, factor)
+                        image_refs.append(image)
+                        thumb = tk.Canvas(card, width=160, height=100, highlightthickness=1, relief="ridge")
+                        thumb.create_image(80, 50, image=image, anchor="center")
+                        thumb_loaded = True
+                    except Exception:
+                        thumb_loaded = False
+
+            if not thumb_loaded:
+                thumb = make_placeholder(card, ext or "file")
+
+            thumb.grid(row=0, column=0, pady=(0, 6))
+
+            name_label = ttk.Label(card, text=os.path.basename(path), width=24, wraplength=160, justify="center")
+            name_label.grid(row=1, column=0)
+
+            if info_summary:
+                info_label = ttk.Label(card, text=info_summary["card"], width=24, wraplength=160, justify="center")
+                info_label.grid(row=2, column=0)
+                rel_row = 3
+            else:
+                info_label = None
+                rel_row = 2
+
+            try:
+                rel_path = os.path.relpath(path, folder_path)
+            except Exception:
+                rel_path = path
+
+            type_label = ttk.Label(card, text=rel_path, width=24, wraplength=160, justify="center")
+            type_label.grid(row=rel_row, column=0)
+
+            widgets = [card, thumb, name_label, type_label]
+            if info_label:
+                widgets.append(info_label)
+
+            for widget in widgets:
+                widget.bind("<Double-Button-1>", lambda event, p=path: open_selected_file(p))
+                Tooltip(widget, tooltip_text)
+
+        configure_content()
+
+
+    def on_tree_select(event=None):
+        selection = tree.selection()
+        if not selection:
+            return
+
+        selected_id = selection[0]
+        folder_path = tree_path_map.get(selected_id)
+
+        if folder_path and os.path.isdir(folder_path):
+            # Single-click should both expand the selected folder and show its contents.
+            try:
+                tree.item(selected_id, open=True)
+            except Exception:
+                pass
+
+            render_files(folder_path)
+
+    def get_selected_browser_folder():
+        selection = tree.selection()
+        if not selection:
+            return output_root
+
+        selected_id = selection[0]
+        folder_path = tree_path_map.get(selected_id)
+
+        if folder_path and os.path.isdir(folder_path):
+            return folder_path
+
+        return output_root
+
+    def open_selected_browser_folder():
+        folder_path = get_selected_browser_folder()
+
+        if os.path.isdir(folder_path):
+            os.startfile(folder_path)
+        else:
+            messagebox.showwarning("Folder not found", f"The selected folder does not exist:\n\n{folder_path}")
+
+    def refresh_tree():
+        for item in tree.get_children(""):
+            tree.delete(item)
+
+        tree_path_map.clear()
+        root_item = tree.insert("", "end", text=os.path.basename(os.path.abspath(output_root)) or output_root, open=True)
+        tree_path_map[root_item] = output_root
+        insert_folder(root_item, output_root)
+        clear_content()
+        browser_status_var.set("Case tree refreshed. Select a folder to view captured files.")
+
+    tree.bind("<<TreeviewSelect>>", on_tree_select)
+
+    ttk.Button(top_bar, text="Refresh", command=refresh_tree).pack(side="right", padx=(6, 0))
+    ttk.Button(top_bar, text="Open Folder", command=open_selected_browser_folder).pack(side="right", padx=(6, 0))
+    ttk.Button(top_bar, text="Open Output Root", command=lambda: os.startfile(output_root)).pack(side="right", padx=(6, 0))
+
+    tree.selection_set(root_id)
+    tree.focus(root_id)
+    render_files(output_root)
 
 
 def on_close():
@@ -2319,6 +3583,8 @@ def on_close():
         except Exception:
             pass
 
+    delete_selected_cookies_file_on_exit()
+
     root.destroy()
 
 
@@ -2342,10 +3608,30 @@ target_status_var = tk.StringVar(value="Impersonate targets: Not checked")
 status_var = tk.StringVar(value="Ready")
 yt_dlp_version_status_var = tk.StringVar(value="yt-dlp: not checked")
 preflight_done_var = tk.BooleanVar(value=False)
+delete_cookies_on_exit_var = tk.BooleanVar(value=APP_SETTINGS_DEFAULTS["delete_cookies_on_exit"])
+check_vpn_var = tk.BooleanVar(value=APP_SETTINGS_DEFAULTS["check_vpn"])
 selected_profile_var = tk.StringVar(value=DEFAULT_PROFILE_NAME)
 capture_options_summary_var = tk.StringVar(value="")
 capture_mode_var = tk.StringVar(value=DEFAULTS["capture_mode"])
 source_scope_var = tk.StringVar(value=DEFAULTS["source_scope"])
+archive_mode_var = tk.StringVar(value=DEFAULTS["archive_mode"])
+max_resolution_var = tk.StringVar(value=DEFAULTS["max_resolution"])
+save_playlist_metadata_var = tk.BooleanVar(value=DEFAULTS["save_playlist_metadata"])
+generate_url_shortcuts_var = tk.BooleanVar(value=DEFAULTS["generate_url_shortcuts"])
+match_keywords_var = tk.StringVar(value=DEFAULTS["match_keywords"])
+reject_keywords_var = tk.StringVar(value=DEFAULTS["reject_keywords"])
+failure_handling_var = tk.StringVar(value=DEFAULTS["failure_handling"])
+show_all_impersonate_targets_var = tk.BooleanVar(value=DEFAULTS["show_all_impersonate_targets"])
+date_after_enabled_var = tk.BooleanVar(value=DEFAULTS["date_after_enabled"])
+date_after_year_var = tk.StringVar(value=DEFAULTS["date_after_year"])
+date_after_month_var = tk.StringVar(value=DEFAULTS["date_after_month"])
+date_after_day_var = tk.StringVar(value=DEFAULTS["date_after_day"])
+date_before_enabled_var = tk.BooleanVar(value=DEFAULTS["date_before_enabled"])
+date_before_year_var = tk.StringVar(value=DEFAULTS["date_before_year"])
+date_before_month_var = tk.StringVar(value=DEFAULTS["date_before_month"])
+date_before_day_var = tk.StringVar(value=DEFAULTS["date_before_day"])
+rate_limit_var = tk.StringVar(value=DEFAULTS["rate_limit"])
+keep_partials_var = tk.BooleanVar(value=DEFAULTS["keep_partials"])
 write_info_json_var = tk.BooleanVar(value=DEFAULTS["write_info_json"])
 write_source_link_var = tk.BooleanVar(value=DEFAULTS["write_source_link"])
 write_description_var = tk.BooleanVar(value=DEFAULTS["write_description"])
@@ -2359,6 +3645,24 @@ for option_var in [
     prefer_mp4_var,
     capture_mode_var,
     source_scope_var,
+    archive_mode_var,
+    max_resolution_var,
+    save_playlist_metadata_var,
+    generate_url_shortcuts_var,
+    match_keywords_var,
+    reject_keywords_var,
+    failure_handling_var,
+    show_all_impersonate_targets_var,
+    date_after_enabled_var,
+    date_after_year_var,
+    date_after_month_var,
+    date_after_day_var,
+    date_before_enabled_var,
+    date_before_year_var,
+    date_before_month_var,
+    date_before_day_var,
+    rate_limit_var,
+    keep_partials_var,
     write_info_json_var,
     write_source_link_var,
     write_description_var,
@@ -2369,6 +3673,7 @@ for option_var in [
 ]:
     option_var.trace_add("write", update_capture_options_summary)
 
+source_scope_var.trace_add("write", update_playlist_metadata_visibility)
 update_capture_options_summary()
 
 main = ttk.Frame(root, padding=12)
@@ -2422,10 +3727,13 @@ cookies_menu.add_command(label="Decrypt Cookies from Storage", command=decrypt_c
 
 tools_menu = tk.Menu(menu_bar, tearoff=0)
 menu_bar.add_cascade(label="Tools", menu=tools_menu)
+tools_menu.add_command(label="Open Case Browser", command=open_case_browser)
+tools_menu.add_separator()
 tools_menu.add_command(label="Check Impersonate Targets", command=check_impersonate_targets)
 tools_menu.add_separator()
 tools_menu.add_command(label="Refresh VPN Adapters", command=refresh_network_adapters)
 tools_menu.add_command(label="Check VPN", command=check_vpn_status)
+update_vpn_tools_menu_state()
 
 profile_menu = tk.Menu(menu_bar, tearoff=0)
 menu_bar.add_cascade(label="Profile", menu=profile_menu)
@@ -2434,6 +3742,17 @@ settings_menu = tk.Menu(menu_bar, tearoff=0)
 menu_bar.add_cascade(label="Settings", menu=settings_menu)
 settings_menu.add_command(label="Save Settings As...", command=save_settings_dialog)
 settings_menu.add_command(label="Load Settings...", command=load_settings_dialog)
+settings_menu.add_separator()
+settings_menu.add_checkbutton(
+    label="Delete Cookies on Exit",
+    variable=delete_cookies_on_exit_var,
+    command=lambda: save_app_settings(show_popup=False),
+)
+settings_menu.add_checkbutton(
+    label="Check VPN",
+    variable=check_vpn_var,
+    command=toggle_check_vpn_setting,
+)
 settings_menu.add_separator()
 settings_menu.add_command(label="Reset Defaults", command=reset_defaults)
 settings_menu.add_separator()
@@ -2515,26 +3834,44 @@ check_targets_button.grid(row=0, column=1, sticky="e")
 
 impersonate_menu = impersonate_menu_box
 
+impersonate_status_frame = ttk.Frame(main)
+impersonate_status_frame.grid(row=8, column=1, columnspan=2, sticky="ew", padx=6, pady=(0, 4))
+impersonate_status_frame.columnconfigure(0, weight=1)
+
 ttk.Label(
-    main,
+    impersonate_status_frame,
     textvariable=target_status_var,
-).grid(row=8, column=1, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+).grid(row=0, column=0, sticky="w")
+
+ttk.Checkbutton(
+    impersonate_status_frame,
+    text="Show all targets",
+    variable=show_all_impersonate_targets_var,
+    command=lambda: target_status_var.set("Impersonate targets: Not checked"),
+).grid(row=0, column=1, sticky="e")
 
 options_frame = ttk.Frame(main)
 options_frame.grid(row=9, column=1, columnspan=2, sticky="ew", padx=6, pady=5)
-options_frame.columnconfigure(1, weight=1)
+options_frame.columnconfigure(2, weight=1)
 
 capture_options_button = ttk.Button(
     options_frame,
     text="Capture Options ▾",
     command=toggle_capture_options_panel,
 )
-capture_options_button.grid(row=0, column=0, sticky="w", padx=(0, 10))
+capture_options_button.grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+advanced_options_button = ttk.Button(
+    options_frame,
+    text="Advanced Options ▾",
+    command=toggle_advanced_options_panel,
+)
+advanced_options_button.grid(row=0, column=1, sticky="w", padx=(0, 10))
 
 ttk.Label(
     options_frame,
     textvariable=capture_options_summary_var,
-).grid(row=0, column=1, sticky="w")
+).grid(row=0, column=2, sticky="w")
 
 vpn_frame = ttk.LabelFrame(main, text="VPN Status", padding=8)
 vpn_frame.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(8, 6))
@@ -2570,6 +3907,8 @@ ttk.Label(vpn_frame, textvariable=vpn_status_var).grid(
     sticky="w",
     pady=(6, 0),
 )
+
+update_vpn_section_visibility()
 
 ttk.Label(
     main,
@@ -2631,7 +3970,7 @@ capture_options_panel = ttk.LabelFrame(main, text="Capture Options", padding=12)
 capture_options_panel.columnconfigure(0, weight=1)
 capture_options_panel.columnconfigure(1, weight=1)
 capture_options_panel.columnconfigure(2, weight=1)
-capture_options_panel.rowconfigure(4, weight=1)
+capture_options_panel.rowconfigure(5, weight=1)
 
 ttk.Label(
     capture_options_panel,
@@ -2681,10 +4020,89 @@ ttk.Checkbutton(
     text="Prefer MP4-compatible streams and merge to MP4",
     variable=prefer_mp4_var,
     command=update_capture_options_summary,
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=2)
+
+ttk.Label(format_frame, text="Max resolution").grid(row=1, column=0, sticky="w", pady=(6, 2))
+max_resolution_menu = ttk.Combobox(
+    format_frame,
+    textvariable=max_resolution_var,
+    values=["best", "2160", "1440", "1080", "720", "480"],
+    state="readonly",
+    width=10,
+)
+max_resolution_menu.grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(6, 2))
+max_resolution_menu.bind("<<ComboboxSelected>>", lambda event: update_capture_options_summary())
+
+ttk.Checkbutton(
+    format_frame,
+    text="Generate Windows .url shortcuts",
+    variable=generate_url_shortcuts_var,
+    command=update_capture_options_summary,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=2)
+
+archive_frame = ttk.LabelFrame(capture_options_panel, text="Archive Mode", padding=8)
+archive_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
+ttk.Radiobutton(
+    archive_frame,
+    text="Use case download archive",
+    variable=archive_mode_var,
+    value="use",
+    command=update_capture_options_summary,
+).pack(anchor="w", pady=2)
+ttk.Radiobutton(
+    archive_frame,
+    text="Ignore archive for this run",
+    variable=archive_mode_var,
+    value="ignore",
+    command=update_capture_options_summary,
+).pack(anchor="w", pady=2)
+ttk.Radiobutton(
+    archive_frame,
+    text="Force re-capture",
+    variable=archive_mode_var,
+    value="force",
+    command=update_capture_options_summary,
 ).pack(anchor="w", pady=2)
 
+date_outer_frame = ttk.LabelFrame(capture_options_panel, text="Date Filters", padding=8)
+date_outer_frame.grid(row=2, column=1, columnspan=2, sticky="nsew", padx=8, pady=(0, 8))
+
+date_filter_frame = ttk.Frame(date_outer_frame)
+date_filter_frame.grid(row=0, column=0, columnspan=6, sticky="ew")
+
+current_year = datetime.now().year
+year_values = [str(year) for year in range(current_year - 10, current_year + 2)]
+month_values = [f"{month:02d}" for month in range(1, 13)]
+day_values = [f"{day:02d}" for day in range(1, 32)]
+
+ttk.Checkbutton(
+    date_filter_frame,
+    text="Date after",
+    variable=date_after_enabled_var,
+    command=update_capture_options_summary,
+).grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
+ttk.Combobox(date_filter_frame, textvariable=date_after_year_var, values=year_values, width=6).grid(row=0, column=1, padx=2, pady=2)
+ttk.Combobox(date_filter_frame, textvariable=date_after_month_var, values=month_values, width=4).grid(row=0, column=2, padx=2, pady=2)
+ttk.Combobox(date_filter_frame, textvariable=date_after_day_var, values=day_values, width=4).grid(row=0, column=3, padx=2, pady=2)
+
+ttk.Checkbutton(
+    date_filter_frame,
+    text="Date before",
+    variable=date_before_enabled_var,
+    command=update_capture_options_summary,
+).grid(row=1, column=0, sticky="w", padx=(0, 6), pady=2)
+ttk.Combobox(date_filter_frame, textvariable=date_before_year_var, values=year_values, width=6).grid(row=1, column=1, padx=2, pady=2)
+ttk.Combobox(date_filter_frame, textvariable=date_before_month_var, values=month_values, width=4).grid(row=1, column=2, padx=2, pady=2)
+ttk.Combobox(date_filter_frame, textvariable=date_before_day_var, values=day_values, width=4).grid(row=1, column=3, padx=2, pady=2)
+
+ttk.Label(
+    date_filter_frame,
+    text="Year / Month / Day",
+).grid(row=2, column=1, columnspan=3, sticky="w", padx=2, pady=(2, 0))
+
+
 artifact_frame = ttk.LabelFrame(capture_options_panel, text="Sidecar Artifacts", padding=8)
-artifact_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+artifact_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 artifact_frame.columnconfigure(0, weight=1)
 artifact_frame.columnconfigure(1, weight=1)
 artifact_frame.columnconfigure(2, weight=1)
@@ -2707,15 +4125,24 @@ for label_text, variable, row_index, column_index in artifact_options:
         command=update_capture_options_summary,
     ).grid(row=row_index, column=column_index, sticky="w", padx=4, pady=3)
 
+playlist_metadata_check = ttk.Checkbutton(
+    artifact_frame,
+    text="Save playlist metadata",
+    variable=save_playlist_metadata_var,
+    command=update_capture_options_summary,
+)
+playlist_metadata_check.grid(row=2, column=1, sticky="w", padx=4, pady=3)
+update_playlist_metadata_visibility()
+
 ttk.Label(
     capture_options_panel,
-    text="Note: comments, subtitles, thumbnails, and metadata availability depend on the source and yt-dlp extractor support.",
+    text="Note: comments, subtitles, thumbnails, date filtering, and metadata availability depend on the source and yt-dlp extractor support.",
     wraplength=980,
     justify="left",
-).grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 12))
+).grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 12))
 
 panel_button_frame = ttk.Frame(capture_options_panel)
-panel_button_frame.grid(row=5, column=0, columnspan=3, sticky="e")
+panel_button_frame.grid(row=6, column=0, columnspan=3, sticky="e")
 
 ttk.Button(
     panel_button_frame,
@@ -2725,10 +4152,96 @@ ttk.Button(
 
 capture_options_panel.grid_remove()
 
+advanced_options_panel = ttk.LabelFrame(main, text="Advanced Options", padding=12)
+advanced_options_panel.columnconfigure(0, weight=1)
+advanced_options_panel.columnconfigure(1, weight=1)
+advanced_options_panel.columnconfigure(2, weight=1)
+
+ttk.Label(
+    advanced_options_panel,
+    text="Advanced controls for filtering, failure behavior, and request pacing.",
+    wraplength=980,
+    justify="left",
+).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+
+keyword_frame = ttk.LabelFrame(advanced_options_panel, text="Match / Reject Keywords", padding=8)
+keyword_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+keyword_frame.columnconfigure(1, weight=1)
+
+ttk.Label(keyword_frame, text="Only capture titles matching").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+ttk.Entry(keyword_frame, textvariable=match_keywords_var).grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=3)
+ttk.Button(keyword_frame, text="Clear", command=clear_match_keywords).grid(row=0, column=2, sticky="e", pady=3)
+
+ttk.Label(keyword_frame, text="Reject titles matching").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
+ttk.Entry(keyword_frame, textvariable=reject_keywords_var).grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=3)
+ttk.Button(keyword_frame, text="Clear", command=clear_reject_keywords).grid(row=1, column=2, sticky="e", pady=3)
+
+ttk.Label(
+    keyword_frame,
+    text="Enter one or more keywords separated by commas. The script builds a safe case-insensitive title filter.",
+    wraplength=900,
+    justify="left",
+).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+failure_frame = ttk.LabelFrame(advanced_options_panel, text="Failure Handling", padding=8)
+failure_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
+ttk.Radiobutton(
+    failure_frame,
+    text="Continue after failed URL",
+    variable=failure_handling_var,
+    value="continue",
+    command=update_capture_options_summary,
+).pack(anchor="w", pady=2)
+ttk.Radiobutton(
+    failure_frame,
+    text="Stop on first failed URL",
+    variable=failure_handling_var,
+    value="stop",
+    command=update_capture_options_summary,
+).pack(anchor="w", pady=2)
+
+rate_frame = ttk.LabelFrame(advanced_options_panel, text="Rate Limit", padding=8)
+rate_frame.grid(row=2, column=1, columnspan=2, sticky="nsew", padx=(8, 0), pady=(0, 8))
+ttk.Radiobutton(
+    rate_frame,
+    text="Fast - 15 sec baseline, jitter up to 30 sec",
+    variable=rate_limit_var,
+    value="fast",
+    command=update_capture_options_summary,
+).pack(anchor="w", pady=2)
+ttk.Radiobutton(
+    rate_frame,
+    text="Normal - 30 sec baseline, jitter up to 60 sec",
+    variable=rate_limit_var,
+    value="normal",
+    command=update_capture_options_summary,
+).pack(anchor="w", pady=2)
+ttk.Radiobutton(
+    rate_frame,
+    text="Cautious - 60 sec baseline, jitter up to 120 sec",
+    variable=rate_limit_var,
+    value="cautious",
+    command=update_capture_options_summary,
+).pack(anchor="w", pady=2)
+
+advanced_button_frame = ttk.Frame(advanced_options_panel)
+advanced_button_frame.grid(row=3, column=0, columnspan=3, sticky="e", pady=(8, 0))
+
+ttk.Button(
+    advanced_button_frame,
+    text="Close Advanced Options",
+    command=close_advanced_options_panel,
+).pack(side="left", padx=6)
+
+advanced_options_panel.grid_remove()
+
 root.protocol("WM_DELETE_WINDOW", on_close)
 
 load_settings(show_popup=False, startup=True)
 update_window_title()
-refresh_network_adapters()
+if check_vpn_var.get():
+    refresh_network_adapters()
+else:
+    vpn_status_var.set("VPN: Check disabled")
 
 root.mainloop()
