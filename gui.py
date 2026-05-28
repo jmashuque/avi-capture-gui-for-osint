@@ -1,13 +1,17 @@
 import base64
+import calendar
+import csv
 import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
 import tempfile
 import urllib.request
+import webbrowser
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -15,6 +19,11 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 
 APP_TITLE = "yt-dlp GUI for OSINT"
+APP_VERSION = "v0.2026.0528"
+APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/ytdlp-gui-for-osint/releases/latest"
+APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/ytdlp-gui-for-osint/releases/latest"
+SETTINGS_SCHEMA_VERSION = 6
+CAPTURE_DATE_MIN = datetime(2000, 1, 1)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(ROOT, "gui-settings.json")
@@ -24,7 +33,7 @@ DEFAULTS = {
     "script_path": os.path.join(ROOT, "script.ps1"),
     "yt_dlp_path": os.path.join(ROOT, "yt-dlp.exe"),
     "input_file": os.path.join(ROOT, "urls.txt"),
-    "case_name": datetime.now().strftime("Case-%Y-%m-%d"),
+    "case_name": "Case-%date%",
     "cookies_file": os.path.join(ROOT, "cookies.txt"),
     "output_root": os.path.join(ROOT, "Investigations"),
     "ffmpeg_folder": ROOT,
@@ -63,6 +72,11 @@ DEFAULTS = {
 APP_SETTINGS_DEFAULTS = {
     "delete_cookies_on_exit": False,
     "check_vpn": True,
+    "dark_mode": False,
+    "case_browser_filter": "All",
+    "case_browser_sort": "Name",
+    "case_browser_current_only": False,
+    "case_browser_icon_scale": "Medium",
 }
 
 DEFAULT_IMPERSONATE_TARGETS = ["None", "chrome", "edge", "firefox"]
@@ -83,6 +97,8 @@ settings_store = {}
 profile_menu = None
 case_browser_images = []
 case_browser_file_map = {}
+last_capture_context = {}
+last_successful_case_summary = ""
 
 
 def browse_file(var, title="Select file"):
@@ -104,6 +120,245 @@ def append_log(text):
 
 def set_status(text):
     status_var.set(text)
+
+
+def get_theme_colors():
+    if dark_mode_var.get():
+        return {
+            "bg": "#1E1E1E",
+            "panel": "#252526",
+            "field": "#1B1B1B",
+            "fg": "#F0F0F0",
+            "muted": "#C8C8C8",
+            "disabled": "#777777",
+            "border": "#3A3A3A",
+            "select_bg": "#264F78",
+            "select_fg": "#FFFFFF",
+            "button_bg": "#333333",
+            "button_active": "#404040",
+            "preflight_fg": "#7DB7FF",
+            "start_fg": "#63C46B",
+            "stop_fg": "#FF6B6B",
+            "copy_fg": "#FFD166",
+            "text_insert": "#FFFFFF",
+        }
+
+    return {
+        "bg": "#F0F0F0",
+        "panel": "#F0F0F0",
+        "field": "#FFFFFF",
+        "fg": "#000000",
+        "muted": "#333333",
+        "disabled": "#777777",
+        "border": "#D0D0D0",
+        "select_bg": "#0078D7",
+        "select_fg": "#FFFFFF",
+        "button_bg": "#F0F0F0",
+        "button_active": "#E5E5E5",
+        "preflight_fg": "#003366",
+        "start_fg": "green",
+        "stop_fg": "red",
+        "copy_fg": "#8A6500",
+        "text_insert": "#000000",
+    }
+
+
+def configure_tk_widget_theme(widget, colors):
+    try:
+        widget_class = widget.winfo_class()
+    except Exception:
+        return
+
+    try:
+        if widget_class in {"Frame", "Labelframe", "Toplevel"}:
+            widget.configure(bg=colors["bg"])
+        elif widget_class in {"Canvas"}:
+            widget.configure(bg=colors["bg"], highlightbackground=colors["border"])
+        elif widget_class in {"Text"}:
+            widget.configure(
+                bg=colors["field"],
+                fg=colors["fg"],
+                insertbackground=colors["text_insert"],
+                selectbackground=colors["select_bg"],
+                selectforeground=colors["select_fg"],
+            )
+        elif widget_class in {"Button"}:
+            widget.configure(
+                bg=colors["button_bg"],
+                activebackground=colors["button_active"],
+                relief="raised",
+            )
+        elif widget_class in {"Label"}:
+            widget.configure(bg=colors["bg"], fg=colors["fg"])
+        elif widget_class in {"Entry"}:
+            widget.configure(
+                bg=colors["field"],
+                fg=colors["fg"],
+                insertbackground=colors["text_insert"],
+                selectbackground=colors["select_bg"],
+                selectforeground=colors["select_fg"],
+            )
+        elif widget_class in {"Menu"}:
+            widget.configure(
+                bg=colors["panel"],
+                fg=colors["fg"],
+                activebackground=colors["select_bg"],
+                activeforeground=colors["select_fg"],
+            )
+    except Exception:
+        pass
+
+    try:
+        for child in widget.winfo_children():
+            configure_tk_widget_theme(child, colors)
+    except Exception:
+        pass
+
+
+def configure_menu_theme(menu, colors):
+    try:
+        menu.configure(
+            bg=colors["panel"],
+            fg=colors["fg"],
+            activebackground=colors["select_bg"],
+            activeforeground=colors["select_fg"],
+            disabledforeground=colors["disabled"],
+        )
+    except Exception:
+        pass
+
+
+def configure_action_buttons_theme(colors):
+    try:
+        preflight_button.configure(
+            fg=colors["preflight_fg"],
+            activeforeground=colors["preflight_fg"],
+            bg=colors["button_bg"],
+            activebackground=colors["button_active"],
+        )
+    except Exception:
+        pass
+
+    try:
+        start_button.configure(
+            fg=colors["start_fg"],
+            activeforeground=colors["start_fg"],
+            bg=colors["button_bg"],
+            activebackground=colors["button_active"],
+        )
+    except Exception:
+        pass
+
+    try:
+        stop_button.configure(
+            fg=colors["stop_fg"],
+            activeforeground=colors["stop_fg"],
+            bg=colors["button_bg"],
+            activebackground=colors["button_active"],
+        )
+    except Exception:
+        pass
+
+    try:
+        copy_summary_button.configure(
+            fg=colors["copy_fg"],
+            activeforeground=colors["copy_fg"],
+            bg=colors["button_bg"],
+            activebackground=colors["button_active"],
+            disabledforeground=colors["disabled"],
+        )
+    except Exception:
+        pass
+
+
+def apply_app_theme():
+    try:
+        colors = get_theme_colors()
+    except Exception:
+        return
+
+    try:
+        style = ttk.Style(root)
+
+        if dark_mode_var.get():
+            try:
+                style.theme_use("clam")
+            except Exception:
+                pass
+        else:
+            try:
+                if ORIGINAL_TTK_THEME:
+                    style.theme_use(ORIGINAL_TTK_THEME)
+            except Exception:
+                pass
+
+        style.configure(".", background=colors["bg"], foreground=colors["fg"])
+        style.configure("TFrame", background=colors["bg"])
+        style.configure("TLabelframe", background=colors["bg"], foreground=colors["fg"], bordercolor=colors["border"])
+        style.configure("TLabelframe.Label", background=colors["bg"], foreground=colors["fg"])
+        style.configure("TLabel", background=colors["bg"], foreground=colors["fg"])
+        style.configure("TButton", background=colors["button_bg"], foreground=colors["fg"])
+        style.configure("TCheckbutton", background=colors["bg"], foreground=colors["fg"])
+        style.configure("TRadiobutton", background=colors["bg"], foreground=colors["fg"])
+        style.configure("TMenubutton", background=colors["button_bg"], foreground=colors["fg"])
+        style.configure("TEntry", fieldbackground=colors["field"], foreground=colors["fg"])
+        style.configure("TCombobox", fieldbackground=colors["field"], foreground=colors["fg"])
+        style.configure("TScrollbar", background=colors["panel"], troughcolor=colors["bg"])
+        style.configure("Treeview", background=colors["field"], fieldbackground=colors["field"], foreground=colors["fg"])
+        style.configure("Treeview.Heading", background=colors["panel"], foreground=colors["fg"])
+
+        style.map(
+            "TButton",
+            background=[("active", colors["button_active"]), ("disabled", colors["panel"])],
+            foreground=[("disabled", colors["disabled"])],
+        )
+        style.map(
+            "TCheckbutton",
+            background=[("active", colors["bg"]), ("disabled", colors["bg"])],
+            foreground=[("disabled", colors["disabled"])],
+        )
+        style.map(
+            "TRadiobutton",
+            background=[("active", colors["bg"]), ("disabled", colors["bg"])],
+            foreground=[("disabled", colors["disabled"])],
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", colors["field"])],
+            foreground=[("readonly", colors["fg"])],
+            selectbackground=[("readonly", colors["select_bg"])],
+            selectforeground=[("readonly", colors["select_fg"])],
+        )
+    except Exception:
+        pass
+
+    try:
+        root.configure(bg=colors["bg"])
+        configure_tk_widget_theme(root, colors)
+    except Exception:
+        pass
+
+    for menu in [
+        menu_bar,
+        file_menu,
+        capture_menu,
+        cookies_menu,
+        tools_menu,
+        profile_menu,
+        settings_menu,
+        help_menu,
+    ]:
+        try:
+            configure_menu_theme(menu, colors)
+        except Exception:
+            pass
+
+    configure_action_buttons_theme(colors)
+
+
+def toggle_dark_mode_setting():
+    apply_app_theme()
+    save_app_settings(show_popup=False)
 
 
 def update_window_title():
@@ -130,6 +385,15 @@ def normalize_impersonate_target(value):
     return value.split()[0].lower()
 
 
+def get_capture_date_max():
+    now = datetime.now()
+    return datetime(now.year, now.month, now.day)
+
+
+def format_capture_date_for_message(date_obj):
+    return date_obj.strftime("%b %d, %Y")
+
+
 def normalize_capture_date(year, month, day, label):
     year = str(year).strip()
     month = str(month).strip()
@@ -144,7 +408,15 @@ def normalize_capture_date(year, month, day, label):
     try:
         date_obj = datetime(int(year), int(month), int(day))
     except Exception:
-        raise ValueError(f"{label} date is invalid.")
+        raise ValueError(f"{label} date is invalid or does not exist.")
+
+    max_date = get_capture_date_max()
+
+    if date_obj < CAPTURE_DATE_MIN:
+        raise ValueError(f"{label} cannot be before {format_capture_date_for_message(CAPTURE_DATE_MIN)}.")
+
+    if date_obj > max_date:
+        raise ValueError(f"{label} cannot be in the future.")
 
     return date_obj.strftime("%Y%m%d")
 
@@ -175,22 +447,438 @@ def get_enabled_capture_dates():
     return date_after, date_before
 
 
+def clamp_capture_date(year, month, day, default_date):
+    max_date = get_capture_date_max()
+
+    try:
+        year_int = int(str(year).strip())
+        month_int = int(str(month).strip())
+        day_int = int(str(day).strip())
+    except Exception:
+        date_obj = default_date
+    else:
+        year_int = max(CAPTURE_DATE_MIN.year, min(max_date.year, year_int))
+        month_int = max(1, min(12, month_int))
+        last_day = calendar.monthrange(year_int, month_int)[1]
+        day_int = max(1, min(last_day, day_int))
+
+        date_obj = datetime(year_int, month_int, day_int)
+
+    if date_obj < CAPTURE_DATE_MIN:
+        date_obj = CAPTURE_DATE_MIN
+
+    if date_obj > max_date:
+        date_obj = max_date
+
+    return date_obj
+
+
+def get_allowed_month_values(year):
+    max_date = get_capture_date_max()
+
+    try:
+        year_int = int(str(year).strip())
+    except Exception:
+        year_int = max_date.year
+
+    start_month = 1
+    end_month = 12
+
+    if year_int <= CAPTURE_DATE_MIN.year:
+        start_month = CAPTURE_DATE_MIN.month
+
+    if year_int >= max_date.year:
+        end_month = max_date.month
+
+    return [f"{month:02d}" for month in range(start_month, end_month + 1)]
+
+
+def get_allowed_day_values(year, month):
+    max_date = get_capture_date_max()
+
+    try:
+        year_int = int(str(year).strip())
+        month_int = int(str(month).strip())
+    except Exception:
+        year_int = max_date.year
+        month_int = max_date.month
+
+    last_day = calendar.monthrange(year_int, month_int)[1]
+    start_day = 1
+    end_day = last_day
+
+    if year_int == CAPTURE_DATE_MIN.year and month_int == CAPTURE_DATE_MIN.month:
+        start_day = CAPTURE_DATE_MIN.day
+
+    if year_int == max_date.year and month_int == max_date.month:
+        end_day = min(end_day, max_date.day)
+
+    return [f"{day:02d}" for day in range(start_day, end_day + 1)]
+
+
+def set_capture_date_vars(prefix, date_obj):
+    if prefix == "after":
+        date_after_year_var.set(str(date_obj.year))
+        date_after_month_var.set(f"{date_obj.month:02d}")
+        date_after_day_var.set(f"{date_obj.day:02d}")
+    else:
+        date_before_year_var.set(str(date_obj.year))
+        date_before_month_var.set(f"{date_obj.month:02d}")
+        date_before_day_var.set(f"{date_obj.day:02d}")
+
+
+def get_capture_date_vars(prefix):
+    if prefix == "after":
+        return date_after_year_var, date_after_month_var, date_after_day_var
+
+    return date_before_year_var, date_before_month_var, date_before_day_var
+
+
+def update_date_filter_day_values(prefix, initialize_missing=False):
+    try:
+        year_var, month_var, day_var = get_capture_date_vars(prefix)
+
+        default_date = CAPTURE_DATE_MIN if prefix == "after" else get_capture_date_max()
+
+        if initialize_missing and not (year_var.get() and month_var.get() and day_var.get()):
+            date_obj = default_date
+        else:
+            date_obj = clamp_capture_date(year_var.get(), month_var.get(), day_var.get(), default_date)
+
+        set_capture_date_vars(prefix, date_obj)
+
+        month_values = get_allowed_month_values(date_obj.year)
+        day_values = get_allowed_day_values(date_obj.year, date_obj.month)
+
+        if prefix == "after":
+            date_after_month_menu["values"] = month_values
+            date_after_day_menu["values"] = day_values
+        else:
+            date_before_month_menu["values"] = month_values
+            date_before_day_menu["values"] = day_values
+
+        update_capture_options_summary()
+    except Exception:
+        pass
+
+
+def update_date_filter_states(*args):
+    try:
+        after_state = "readonly" if date_after_enabled_var.get() else "disabled"
+        before_state = "readonly" if date_before_enabled_var.get() else "disabled"
+
+        if date_after_enabled_var.get():
+            update_date_filter_day_values("after", initialize_missing=True)
+
+        if date_before_enabled_var.get():
+            update_date_filter_day_values("before", initialize_missing=True)
+
+        for widget in (date_after_year_menu, date_after_month_menu, date_after_day_menu):
+            widget.config(state=after_state)
+
+        for widget in (date_before_year_menu, date_before_month_menu, date_before_day_menu):
+            widget.config(state=before_state)
+
+        update_capture_options_summary()
+    except Exception:
+        pass
+
+
+def on_date_filter_combo_changed(prefix):
+    update_date_filter_day_values(prefix)
+
+
 def safe_case_name(name):
     invalid_chars = '\\/:*?"<>|'
     return "".join("_" if ch in invalid_chars else ch for ch in name).strip()
 
 
-def get_current_case_folder():
+def get_case_template_values(now=None):
+    now = now or datetime.now()
+
+    return {
+        "%date%": now.strftime("%Y-%m-%d"),
+        "%time%": now.strftime("%H-%M-%S"),
+        "%datetime%": now.strftime("%Y-%m-%d_%H-%M-%S"),
+        "%year%": now.strftime("%Y"),
+        "%month%": now.strftime("%m"),
+        "%day%": now.strftime("%d"),
+        "%hour%": now.strftime("%H"),
+        "%minute%": now.strftime("%M"),
+        "%second%": now.strftime("%S"),
+    }
+
+
+def render_case_name_template(template, now=None):
+    rendered = str(template or "").strip()
+
+    for tag, value in get_case_template_values(now).items():
+        rendered = rendered.replace(tag, value)
+
+    return rendered
+
+
+def get_resolved_case_name(now=None):
+    template = case_name_var.get().strip()
+    rendered = render_case_name_template(template, now=now)
+    return safe_case_name(rendered)
+
+
+def insert_case_name_tag(tag):
+    try:
+        case_name_entry.insert("insert", tag)
+        case_name_entry.focus_set()
+    except Exception:
+        current = case_name_var.get()
+        case_name_var.set(f"{current}{tag}")
+
+
+def get_current_case_folder(now=None):
     output_root = output_root_var.get().strip()
-    case_name = safe_case_name(case_name_var.get().strip())
+    case_name = get_resolved_case_name(now=now)
 
     if not output_root:
         raise ValueError("Output Root is blank.")
 
     if not case_name:
-        raise ValueError("Case Name is blank.")
+        raise ValueError("Case Name is blank after resolving the template.")
 
     return os.path.join(output_root, case_name)
+
+
+def case_folder_is_populated(case_folder):
+    if not os.path.isdir(case_folder):
+        return False
+
+    try:
+        with os.scandir(case_folder) as entries:
+            for entry in entries:
+                return True
+    except Exception:
+        return False
+
+    return False
+
+
+def update_case_folder_preview(*args):
+    try:
+        output_root = output_root_var.get().strip()
+        resolved_name = get_resolved_case_name()
+
+        if not output_root:
+            case_folder_preview_var.set("Resolved case folder: Output Root is blank")
+            return
+
+        if not resolved_name:
+            case_folder_preview_var.set("Resolved case folder: Case name is blank after resolving template")
+            return
+
+        case_folder = os.path.join(output_root, resolved_name)
+
+        if case_folder_is_populated(case_folder):
+            case_folder_preview_var.set(f"Resolved case folder: {case_folder}  [existing populated folder]")
+        elif os.path.isdir(case_folder):
+            case_folder_preview_var.set(f"Resolved case folder: {case_folder}  [folder exists]")
+        else:
+            case_folder_preview_var.set(f"Resolved case folder: {case_folder}")
+    except Exception as e:
+        try:
+            case_folder_preview_var.set(f"Resolved case folder: unavailable ({e})")
+        except Exception:
+            pass
+
+
+def confirm_case_folder_collision():
+    try:
+        case_folder = get_current_case_folder()
+    except Exception as e:
+        messagebox.showerror("Invalid case folder", str(e))
+        return False
+
+    if case_folder_is_populated(case_folder):
+        return messagebox.askyesno(
+            "Existing populated case folder",
+            "The resolved case folder already exists and contains files or folders:\n\n"
+            f"{case_folder}\n\n"
+            "Starting this capture may add files to the existing case and reuse its archive/history.\n\n"
+            "Continue?",
+        )
+
+    return True
+
+
+def get_tool_first_line(command, cwd=None, timeout=20):
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd or ROOT,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        output = (result.stdout or result.stderr or "").strip()
+        first_line = output.splitlines()[0].strip() if output else ""
+        return {
+            "command": " ".join(command),
+            "exit_code": result.returncode,
+            "version": first_line or "unavailable",
+            "ok": result.returncode == 0 and bool(first_line),
+        }
+    except Exception as e:
+        return {
+            "command": " ".join(command),
+            "exit_code": None,
+            "version": f"error: {e}",
+            "ok": False,
+        }
+
+
+def resolve_deno_executable_for_gui():
+    candidate = os.path.join(ROOT, "deno.exe")
+    if os.path.isfile(candidate):
+        return candidate
+
+    return shutil.which("deno.exe") or shutil.which("deno") or "deno"
+
+
+def resolve_ffmpeg_executable_for_gui(tool_name):
+    ffmpeg_folder = ffmpeg_folder_var.get().strip()
+
+    if ffmpeg_folder:
+        candidate = os.path.join(ffmpeg_folder, tool_name)
+        if os.path.isfile(candidate):
+            return candidate
+
+    return shutil.which(tool_name) or shutil.which(os.path.splitext(tool_name)[0]) or tool_name
+
+
+def query_capture_tool_versions_for_log():
+    yt_dlp_path = yt_dlp_path_var.get().strip()
+    ffmpeg_exe = resolve_ffmpeg_executable_for_gui("ffmpeg.exe")
+    ffprobe_exe = resolve_ffmpeg_executable_for_gui("ffprobe.exe")
+    deno_exe = resolve_deno_executable_for_gui()
+
+    versions = {
+        "app": APP_VERSION,
+        "powershell_script": script_path_var.get().strip(),
+        "yt_dlp_path": yt_dlp_path,
+        "yt_dlp": get_tool_first_line([yt_dlp_path, "--version"], cwd=os.path.dirname(os.path.abspath(yt_dlp_path)) or ROOT) if yt_dlp_path else {"version": "not configured", "ok": False},
+        "ffmpeg_path": ffmpeg_exe,
+        "ffmpeg": get_tool_first_line([ffmpeg_exe, "-version"]),
+        "ffprobe_path": ffprobe_exe,
+        "ffprobe": get_tool_first_line([ffprobe_exe, "-version"]),
+        "deno_path": deno_exe,
+        "deno": get_tool_first_line([deno_exe, "--version"]),
+    }
+
+    return versions
+
+
+def log_capture_tool_versions(versions):
+    append_log("Tool and script versions:\n")
+    append_log(f"  App: {versions.get('app', APP_VERSION)}\n")
+    append_log(f"  PowerShell script: {versions.get('powershell_script', '')}\n")
+    append_log(f"  yt-dlp path: {versions.get('yt_dlp_path', '')}\n")
+    append_log(f"  yt-dlp: {versions.get('yt_dlp', {}).get('version', 'unavailable')}\n")
+    append_log(f"  FFmpeg path: {versions.get('ffmpeg_path', '')}\n")
+    append_log(f"  FFmpeg: {versions.get('ffmpeg', {}).get('version', 'unavailable')}\n")
+    append_log(f"  FFprobe path: {versions.get('ffprobe_path', '')}\n")
+    append_log(f"  FFprobe: {versions.get('ffprobe', {}).get('version', 'unavailable')}\n")
+    append_log(f"  Deno path: {versions.get('deno_path', '')}\n")
+    append_log(f"  Deno: {versions.get('deno', {}).get('version', 'unavailable')}\n\n")
+
+
+def count_case_files(case_folder):
+    counts = {
+        "files": 0,
+        "media": 0,
+        "metadata": 0,
+        "logs": 0,
+        "manifests": 0,
+    }
+
+    if not os.path.isdir(case_folder):
+        return counts
+
+    for root_dir, dir_names, file_names in os.walk(case_folder):
+        dir_names[:] = [name for name in dir_names if name.lower() not in {"__pycache__"}]
+
+        for file_name in file_names:
+            path = os.path.join(root_dir, file_name)
+            ext = os.path.splitext(file_name)[1].lower()
+            counts["files"] += 1
+
+            if is_browser_media_file(path):
+                counts["media"] += 1
+            elif ext == ".json":
+                counts["metadata"] += 1
+            elif ext == ".log":
+                counts["logs"] += 1
+            elif "manifest" in file_name.lower():
+                counts["manifests"] += 1
+
+    return counts
+
+
+def build_case_summary_text(exit_code, submitted_url_count, paths, versions, counts):
+    lines = [
+        "yt-dlp GUI for OSINT - Case Summary",
+        "",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"App version: {APP_VERSION}",
+        f"Exit code: {exit_code}",
+        f"Submitted URLs: {submitted_url_count}",
+        "",
+        "Case paths:",
+        f"  Case folder: {paths.get('case_folder', '')}",
+        f"  Media folder: {paths.get('media_folder', '')}",
+        f"  Logs folder: {paths.get('logs_folder', '')}",
+        f"  Manifests folder: {paths.get('manifests_folder', '')}",
+        f"  Download archive: {paths.get('download_archive', '')}",
+        "",
+        "Counts:",
+        f"  Total files: {counts.get('files', 0)}",
+        f"  Media files: {counts.get('media', 0)}",
+        f"  Metadata JSON files: {counts.get('metadata', 0)}",
+        f"  Log files: {counts.get('logs', 0)}",
+        f"  Manifest files: {counts.get('manifests', 0)}",
+        "",
+        "Tools:",
+        f"  PowerShell script: {versions.get('powershell_script', '')}",
+        f"  yt-dlp path: {versions.get('yt_dlp_path', '')}",
+        f"  yt-dlp: {versions.get('yt_dlp', {}).get('version', 'unavailable')}",
+        f"  FFmpeg path: {versions.get('ffmpeg_path', '')}",
+        f"  FFmpeg: {versions.get('ffmpeg', {}).get('version', 'unavailable')}",
+        f"  FFprobe path: {versions.get('ffprobe_path', '')}",
+        f"  FFprobe: {versions.get('ffprobe', {}).get('version', 'unavailable')}",
+        f"  Deno path: {versions.get('deno_path', '')}",
+        f"  Deno: {versions.get('deno', {}).get('version', 'unavailable')}",
+        "",
+        "Capture options:",
+        f"  Profile: {selected_profile_var.get()}",
+        f"  Case name template: {case_name_var.get()}",
+        f"  Resolved case name: {os.path.basename(paths.get('case_folder', ''))}",
+        f"  Capture mode: {capture_mode_var.get()}",
+        f"  Source scope: {source_scope_var.get()}",
+        f"  Archive mode: {archive_mode_var.get()}",
+        f"  Max resolution: {max_resolution_var.get()}",
+        f"  Failure handling: {failure_handling_var.get()}",
+        f"  Rate limit: {rate_limit_var.get()}",
+        f"  Impersonate target: {impersonate_var.get()}",
+        f"  VPN check: {'enabled' if check_vpn_var.get() else 'disabled'}",
+    ]
+
+    return "\n".join(lines)
+
+
+def copy_case_summary():
+    if not last_successful_case_summary:
+        messagebox.showinfo("No successful summary", "No successful case summary is available yet.")
+        return
+
+    root.clipboard_clear()
+    root.clipboard_append(last_successful_case_summary)
+    append_log("\nCase summary copied to clipboard.\n")
 
 
 def get_expected_run_paths():
@@ -725,10 +1413,19 @@ def validate_inputs():
         raise ValueError("Case name cannot be blank.")
 
     get_enabled_capture_dates()
+    update_case_folder_preview()
 
 
 def build_powershell_command():
     input_path = create_url_input_file()
+    capture_timestamp = datetime.now()
+    resolved_case_name = get_resolved_case_name(now=capture_timestamp)
+
+    if not resolved_case_name:
+        raise ValueError("Case Name is blank after resolving the template.")
+
+    if resolved_case_name != case_name_var.get().strip():
+        append_log(f"\nResolved case name template: {case_name_var.get().strip()} -> {resolved_case_name}\n")
 
     cmd = [
         "powershell.exe",
@@ -742,7 +1439,7 @@ def build_powershell_command():
         "-InputFile",
         input_path,
         "-CaseName",
-        case_name_var.get().strip(),
+        resolved_case_name,
         "-OutputRoot",
         output_root_var.get().strip(),
     ]
@@ -844,8 +1541,8 @@ def build_powershell_command():
 
 
 def preflight_check(show_success_popup=True):
-    log_box.delete("1.0", "end")
-    append_log("Running preflight check...\n\n")
+    append_log("\n========== Preflight Check ==========")
+    append_log("\nRunning preflight check...\n\n")
 
     checks = []
 
@@ -896,25 +1593,44 @@ def preflight_check(show_success_popup=True):
         add_check("Output root exists or can be created", False, str(e))
 
     if os.path.isfile(yt_dlp_path):
-        try:
-            result = subprocess.run(
-                [yt_dlp_path, "--version"],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                timeout=20,
-            )
-            output = (result.stdout or result.stderr or "").strip()
-            add_check("yt-dlp can run", result.returncode == 0, output)
-        except Exception as e:
-            add_check("yt-dlp can run", False, str(e))
+        version_info = get_tool_first_line(
+            [yt_dlp_path, "--version"],
+            cwd=os.path.dirname(os.path.abspath(yt_dlp_path)) or ROOT,
+            timeout=20,
+        )
+        add_check("yt-dlp can run", version_info["ok"], version_info["version"])
+
+        if version_info["ok"]:
+            yt_dlp_version_status_var.set(f"yt-dlp: {version_info['version']}")
+        else:
+            yt_dlp_version_status_var.set("yt-dlp: version check failed")
     else:
+        yt_dlp_version_status_var.set("yt-dlp: not found")
         add_check("yt-dlp can run", False, "yt-dlp path is invalid")
+
+    if os.path.isfile(ffmpeg_path):
+        version_info = get_tool_first_line([ffmpeg_path, "-version"], timeout=20)
+        add_check("ffmpeg can run", version_info["ok"], version_info["version"])
+    else:
+        add_check("ffmpeg can run", False, "ffmpeg path is invalid")
+
+    if os.path.isfile(ffprobe_path):
+        version_info = get_tool_first_line([ffprobe_path, "-version"], timeout=20)
+        add_check("ffprobe can run", version_info["ok"], version_info["version"])
+    else:
+        add_check("ffprobe can run", False, "ffprobe path is invalid")
+
+    if os.path.isfile(deno_path):
+        version_info = get_tool_first_line([deno_path, "--version"], timeout=20)
+        add_check("deno can run", version_info["ok"], version_info["version"])
+    else:
+        add_check("deno can run", False, "deno path is invalid")
 
     failed = [item for item in checks if not item[1]]
 
     append_log("\nPreflight complete.\n")
     append_log(f"Passed: {len(checks) - len(failed)} / {len(checks)}\n")
+    append_log("=====================================\n")
 
     if failed:
         set_status("Preflight failed")
@@ -991,7 +1707,7 @@ def apply_settings_dict(settings):
     script_path_var.set(settings.get("script_path", DEFAULTS["script_path"]))
     yt_dlp_path_var.set(settings.get("yt_dlp_path", DEFAULTS["yt_dlp_path"]))
     input_file_var.set(settings.get("input_file", DEFAULTS["input_file"]))
-    case_name_var.set(settings.get("case_name", datetime.now().strftime("Case-%Y-%m-%d")))
+    case_name_var.set(settings.get("case_name", DEFAULTS["case_name"]))
     cookies_file_var.set(settings.get("cookies_file", DEFAULTS["cookies_file"]))
     output_root_var.set(settings.get("output_root", DEFAULTS["output_root"]))
     ffmpeg_folder_var.set(settings.get("ffmpeg_folder", DEFAULTS["ffmpeg_folder"]))
@@ -1029,15 +1745,18 @@ def apply_settings_dict(settings):
 
 
 def make_default_profile_settings():
-    data = DEFAULTS.copy()
-    data["case_name"] = datetime.now().strftime("Case-%Y-%m-%d")
-    return data
+    return DEFAULTS.copy()
 
 
 def get_app_settings_dict():
     return {
         "delete_cookies_on_exit": delete_cookies_on_exit_var.get(),
         "check_vpn": check_vpn_var.get(),
+        "dark_mode": dark_mode_var.get(),
+        "case_browser_filter": case_browser_filter_var.get(),
+        "case_browser_sort": case_browser_sort_var.get(),
+        "case_browser_current_only": case_browser_current_only_var.get(),
+        "case_browser_icon_scale": case_browser_icon_scale_var.get(),
     }
 
 
@@ -1049,41 +1768,131 @@ def apply_app_settings_dict(settings):
     check_vpn_var.set(
         bool(settings.get("check_vpn", APP_SETTINGS_DEFAULTS["check_vpn"]))
     )
+    dark_mode_var.set(
+        bool(settings.get("dark_mode", APP_SETTINGS_DEFAULTS["dark_mode"]))
+    )
+    apply_app_theme()
+    case_browser_filter_var.set(
+        settings.get("case_browser_filter", APP_SETTINGS_DEFAULTS["case_browser_filter"])
+    )
+    case_browser_sort_var.set(
+        settings.get("case_browser_sort", APP_SETTINGS_DEFAULTS["case_browser_sort"])
+    )
+    case_browser_current_only_var.set(
+        bool(settings.get("case_browser_current_only", APP_SETTINGS_DEFAULTS["case_browser_current_only"]))
+    )
+    case_browser_icon_scale_var.set(
+        settings.get("case_browser_icon_scale", APP_SETTINGS_DEFAULTS["case_browser_icon_scale"])
+    )
     update_vpn_section_visibility()
+
+
+def get_app_settings_summary_lines():
+    delete_state = "enabled" if delete_cookies_on_exit_var.get() else "disabled"
+    vpn_state = "enabled" if check_vpn_var.get() else "disabled"
+    return [
+        f"Delete cookies on exit: {delete_state}",
+        f"Check VPN: {vpn_state}",
+    ]
+
+
+def ensure_unrecognized_settings_store(store):
+    if not isinstance(store, dict):
+        store = {}
+
+    unrecognized = store.get("unrecognized_settings")
+    if not isinstance(unrecognized, dict):
+        unrecognized = {}
+
+    for key in ("top_level", "profiles", "app_settings"):
+        if not isinstance(unrecognized.get(key), dict):
+            unrecognized[key] = {}
+
+    store["unrecognized_settings"] = unrecognized
+    return store
 
 
 def ensure_app_settings_store(store):
     if not isinstance(store, dict):
         store = {}
 
-    if not isinstance(store.get("app_settings"), dict):
-        store["app_settings"] = APP_SETTINGS_DEFAULTS.copy()
-    else:
-        merged = APP_SETTINGS_DEFAULTS.copy()
-        merged.update(store["app_settings"])
-        store["app_settings"] = merged
+    store = ensure_unrecognized_settings_store(store)
 
+    raw_app_settings = store.get("app_settings", {})
+    if not isinstance(raw_app_settings, dict):
+        raw_app_settings = {}
+
+    recognized = APP_SETTINGS_DEFAULTS.copy()
+    app_unknown = {}
+
+    for key, value in raw_app_settings.items():
+        if key in APP_SETTINGS_DEFAULTS:
+            recognized[key] = value
+        else:
+            app_unknown[key] = value
+
+    existing_app_unknown = store["unrecognized_settings"].get("app_settings", {})
+    if isinstance(existing_app_unknown, dict):
+        existing_app_unknown.update(app_unknown)
+        store["unrecognized_settings"]["app_settings"] = existing_app_unknown
+    else:
+        store["unrecognized_settings"]["app_settings"] = app_unknown
+
+    store["app_settings"] = recognized
     return store
 
 
-def log_app_settings_status():
-    delete_state = "enabled" if delete_cookies_on_exit_var.get() else "disabled"
-    vpn_state = "enabled" if check_vpn_var.get() else "disabled"
-    append_log(f"Delete cookies on exit: {delete_state}\n")
-    append_log(f"Check VPN: {vpn_state}\n")
+def merge_profile_settings_with_defaults(profile_settings, profile_name=None, store=None):
+    profile_settings = profile_settings if isinstance(profile_settings, dict) else {}
+
+    recognized = make_default_profile_settings()
+    unknown = {}
+
+    for key, value in profile_settings.items():
+        if key in DEFAULTS:
+            recognized[key] = value
+        else:
+            unknown[key] = value
+
+    if profile_name and store is not None and unknown:
+        store = ensure_unrecognized_settings_store(store)
+        existing = store["unrecognized_settings"].setdefault("profiles", {}).get(profile_name, {})
+        if not isinstance(existing, dict):
+            existing = {}
+        existing.update(unknown)
+        store["unrecognized_settings"]["profiles"][profile_name] = existing
+
+    return recognized
 
 
-def save_app_settings(show_popup=False):
+def log_app_settings_status(prefix="App settings"):
+    append_log(f"{prefix}:\n")
+    for line in get_app_settings_summary_lines():
+        append_log(f"  - {line}\n")
+
+
+def save_app_settings(show_popup=False, changed_setting_label=None):
     store = ensure_settings_store()
     store = ensure_app_settings_store(store)
     store["app_settings"] = get_app_settings_dict()
-    store["version"] = 2
+    store["version"] = SETTINGS_SCHEMA_VERSION
 
     try:
+        changed = settings_payload_has_changed(SETTINGS_FILE, store)
+
+        if not changed:
+            if show_popup:
+                messagebox.showinfo("Settings unchanged", f"No app setting changes detected.\n\n{SETTINGS_FILE}")
+            return True
+
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(store, f, indent=2)
 
-        append_log(f"\nApp settings saved to: {SETTINGS_FILE}\n")
+        if changed_setting_label:
+            append_log(f"\nApp-level setting changed: {changed_setting_label}\n")
+            append_log(f"App settings saved to: {SETTINGS_FILE}\n")
+        elif show_popup:
+            append_log(f"\nApp settings saved to: {SETTINGS_FILE}\n")
 
         if show_popup:
             messagebox.showinfo("Settings saved", f"Settings saved to:\n\n{SETTINGS_FILE}")
@@ -1120,7 +1929,8 @@ def update_vpn_section_visibility():
 
 def toggle_check_vpn_setting():
     update_vpn_section_visibility()
-    save_app_settings(show_popup=False)
+    state = "enabled" if check_vpn_var.get() else "disabled"
+    save_app_settings(show_popup=False, changed_setting_label=f"Check VPN {state}")
 
 
 def delete_selected_cookies_file_on_exit():
@@ -1149,35 +1959,71 @@ def delete_selected_cookies_file_on_exit():
         )
 
 
+def get_settings_store_version(raw):
+    if not isinstance(raw, dict):
+        return 1
+
+    version = raw.get("version", 1)
+
+    try:
+        return int(version)
+    except Exception:
+        return 1
+
+
 def normalize_settings_store(raw):
-    if isinstance(raw, dict) and "profiles" in raw and isinstance(raw.get("profiles"), dict):
+    raw = raw if isinstance(raw, dict) else {}
+    source_version = get_settings_store_version(raw)
+
+    store = {
+        "version": SETTINGS_SCHEMA_VERSION,
+        "loaded_version": source_version,
+        "profiles": {},
+        "app_settings": {},
+        "unrecognized_settings": {
+            "top_level": {},
+            "profiles": {},
+            "app_settings": {},
+        },
+    }
+
+    existing_unrecognized = raw.get("unrecognized_settings", {})
+    if isinstance(existing_unrecognized, dict):
+        for key in ("top_level", "profiles", "app_settings"):
+            if isinstance(existing_unrecognized.get(key), dict):
+                store["unrecognized_settings"][key].update(existing_unrecognized[key])
+
+    recognized_top_level = {"version", "profiles", "app_settings", "unrecognized_settings", "loaded_version"}
+    for key, value in raw.items():
+        if key not in recognized_top_level:
+            store["unrecognized_settings"]["top_level"][key] = value
+
+    if "profiles" in raw and isinstance(raw.get("profiles"), dict):
         profiles = raw.get("profiles", {})
-    elif isinstance(raw, dict):
+    else:
         # Backward compatibility with older flat settings files.
         profiles = {DEFAULT_PROFILE_NAME: raw}
-    else:
-        profiles = {}
-
-    clean_profiles = {}
 
     for name, profile_settings in profiles.items():
         profile_name = str(name).strip()
         if not profile_name:
             continue
 
-        if isinstance(profile_settings, dict):
-            clean_profiles[profile_name] = profile_settings
+        store["profiles"][profile_name] = merge_profile_settings_with_defaults(
+            profile_settings,
+            profile_name=profile_name,
+            store=store,
+        )
 
-    if DEFAULT_PROFILE_NAME not in clean_profiles:
-        clean_profiles[DEFAULT_PROFILE_NAME] = make_default_profile_settings()
+    if DEFAULT_PROFILE_NAME not in store["profiles"]:
+        store["profiles"][DEFAULT_PROFILE_NAME] = make_default_profile_settings()
 
-    app_settings = raw.get("app_settings", {}) if isinstance(raw, dict) else {}
+    store["app_settings"] = raw.get("app_settings", {}) if isinstance(raw.get("app_settings", {}), dict) else {}
+    store = ensure_app_settings_store(store)
+    store["version"] = SETTINGS_SCHEMA_VERSION
+    store["loaded_version"] = source_version
 
-    return ensure_app_settings_store({
-        "version": 2,
-        "profiles": clean_profiles,
-        "app_settings": app_settings,
-    })
+    return store
 
 
 def ensure_settings_store():
@@ -1185,9 +2031,16 @@ def ensure_settings_store():
 
     if not isinstance(settings_store, dict) or "profiles" not in settings_store:
         settings_store = {
-            "version": 2,
+            "version": SETTINGS_SCHEMA_VERSION,
+            "loaded_version": SETTINGS_SCHEMA_VERSION,
             "profiles": {
                 DEFAULT_PROFILE_NAME: get_settings_dict(),
+            },
+            "app_settings": get_app_settings_dict(),
+            "unrecognized_settings": {
+                "top_level": {},
+                "profiles": {},
+                "app_settings": {},
             },
         }
 
@@ -1197,7 +2050,10 @@ def ensure_settings_store():
     if DEFAULT_PROFILE_NAME not in settings_store["profiles"]:
         settings_store["profiles"][DEFAULT_PROFILE_NAME] = get_settings_dict()
 
+    settings_store = ensure_unrecognized_settings_store(settings_store)
     settings_store = ensure_app_settings_store(settings_store)
+    settings_store["version"] = SETTINGS_SCHEMA_VERSION
+    settings_store.setdefault("loaded_version", SETTINGS_SCHEMA_VERSION)
 
     return settings_store
 
@@ -1239,6 +2095,33 @@ def rebuild_profile_menu():
         )
 
 
+def canonicalize_settings_for_compare(data):
+    try:
+        return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        return ""
+
+
+def read_json_for_compare(path):
+    if not path or not os.path.isfile(path):
+        return None
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def settings_payload_has_changed(path, new_payload):
+    existing_payload = read_json_for_compare(path)
+
+    if existing_payload is None:
+        return True
+
+    return canonicalize_settings_for_compare(existing_payload) != canonicalize_settings_for_compare(new_payload)
+
+
 def save_settings(show_popup=True, path=None):
     global settings_store
 
@@ -1252,7 +2135,14 @@ def save_settings(show_popup=True, path=None):
         # Profile menu's explicit save command.
         store["profiles"][DEFAULT_PROFILE_NAME] = get_settings_dict()
         store["app_settings"] = get_app_settings_dict()
-        store["version"] = 2
+        store["version"] = SETTINGS_SCHEMA_VERSION
+
+        changed = settings_payload_has_changed(settings_path, store)
+
+        if not changed:
+            if show_popup:
+                messagebox.showinfo("Settings unchanged", f"No settings changes detected.\n\n{settings_path}")
+            return True
 
         with open(settings_path, "w", encoding="utf-8") as f:
             json.dump(store, f, indent=2)
@@ -1295,11 +2185,17 @@ def load_settings(show_popup=True, startup=False, path=None):
 
     if not os.path.isfile(settings_path):
         settings_store = {
-            "version": 2,
+            "version": SETTINGS_SCHEMA_VERSION,
+            "loaded_version": SETTINGS_SCHEMA_VERSION,
             "profiles": {
                 DEFAULT_PROFILE_NAME: make_default_profile_settings(),
             },
             "app_settings": APP_SETTINGS_DEFAULTS.copy(),
+            "unrecognized_settings": {
+                "top_level": {},
+                "profiles": {},
+                "app_settings": {},
+            },
         }
         apply_app_settings_dict(settings_store["app_settings"])
         append_log(f"Settings file not found. Using defaults.\nExpected path: {settings_path}\n")
@@ -1322,8 +2218,14 @@ def load_settings(show_popup=True, startup=False, path=None):
         update_window_title()
 
         append_log(f"Settings loaded from: {settings_path}\n")
+        loaded_version = settings_store.get("loaded_version", 1)
+        append_log(f"Settings file version loaded: {loaded_version}; current schema version: {SETTINGS_SCHEMA_VERSION}\n")
+        if loaded_version < SETTINGS_SCHEMA_VERSION:
+            append_log("Older settings file detected. Recognized values were imported, newer recognized values were created with defaults, and unrecognized values were preserved under unrecognized_settings.\n")
+        elif loaded_version > SETTINGS_SCHEMA_VERSION:
+            append_log("Newer settings file detected. Recognized values were imported where possible and unrecognized values were preserved under unrecognized_settings.\n")
         append_log(f"Loaded {len(settings_store['profiles'])} profile(s). Active profile: {DEFAULT_PROFILE_NAME}\n")
-        log_app_settings_status()
+        log_app_settings_status("Loaded app settings")
 
         if show_popup and not startup:
             messagebox.showinfo(
@@ -1337,11 +2239,17 @@ def load_settings(show_popup=True, startup=False, path=None):
 
     except Exception as e:
         settings_store = {
-            "version": 2,
+            "version": SETTINGS_SCHEMA_VERSION,
+            "loaded_version": SETTINGS_SCHEMA_VERSION,
             "profiles": {
                 DEFAULT_PROFILE_NAME: make_default_profile_settings(),
             },
             "app_settings": APP_SETTINGS_DEFAULTS.copy(),
+            "unrecognized_settings": {
+                "top_level": {},
+                "profiles": {},
+                "app_settings": {},
+            },
         }
         apply_app_settings_dict(settings_store["app_settings"])
         append_log(f"Settings file was found but could not be loaded. Using defaults.\nError: {e}\n")
@@ -1419,7 +2327,7 @@ def save_current_settings_to_profile():
 
     store["profiles"][profile_name] = get_settings_dict()
     store["app_settings"] = get_app_settings_dict()
-    store["version"] = 2
+    store["version"] = SETTINGS_SCHEMA_VERSION
     selected_profile_var.set(profile_name)
     update_window_title()
 
@@ -1471,6 +2379,60 @@ def delete_selected_profile():
     rebuild_profile_menu()
 
 
+def delete_settings_file():
+    confirm = messagebox.askyesno(
+        "Delete settings file?",
+        "This will delete the portable settings file:\n\n"
+        f"{SETTINGS_FILE}\n\n"
+        "All saved profiles in that settings file will be deleted. "
+        "The current GUI settings will be reset to defaults.\n\n"
+        "Continue?",
+    )
+
+    if not confirm:
+        return
+
+    try:
+        if os.path.isfile(SETTINGS_FILE):
+            os.remove(SETTINGS_FILE)
+            append_log(f"\nDeleted settings file: {SETTINGS_FILE}\n")
+        else:
+            append_log(f"\nSettings file was already missing: {SETTINGS_FILE}\n")
+
+        global settings_store
+        settings_store = {
+            "version": SETTINGS_SCHEMA_VERSION,
+            "loaded_version": SETTINGS_SCHEMA_VERSION,
+            "profiles": {
+                DEFAULT_PROFILE_NAME: make_default_profile_settings(),
+            },
+            "app_settings": APP_SETTINGS_DEFAULTS.copy(),
+            "unrecognized_settings": {
+                "top_level": {},
+                "profiles": {},
+                "app_settings": {},
+            },
+        }
+
+        apply_settings_dict(make_default_profile_settings())
+        apply_app_settings_dict(APP_SETTINGS_DEFAULTS.copy())
+        urls_text.delete("1.0", "end")
+        target_status_var.set("Impersonate targets: Not checked")
+        preflight_done_var.set(False)
+        selected_profile_var.set(DEFAULT_PROFILE_NAME)
+        update_window_title()
+        update_case_folder_preview()
+        rebuild_profile_menu()
+
+        append_log("Current settings were reset to defaults. Saved custom profiles were removed with the deleted settings file.\n")
+        messagebox.showinfo(
+            "Settings deleted",
+            "The settings file was deleted and the current GUI settings were reset to defaults.",
+        )
+    except Exception as e:
+        messagebox.showerror("Delete failed", f"Could not delete the settings file:\n\n{e}")
+
+
 def reset_defaults():
     store = ensure_settings_store()
 
@@ -1483,9 +2445,7 @@ def reset_defaults():
     selected_profile_var.set(DEFAULT_PROFILE_NAME)
     update_window_title()
 
-    delete_cookies_on_exit_var.set(APP_SETTINGS_DEFAULTS["delete_cookies_on_exit"])
-    check_vpn_var.set(APP_SETTINGS_DEFAULTS["check_vpn"])
-    update_vpn_section_visibility()
+    apply_app_settings_dict(APP_SETTINGS_DEFAULTS.copy())
     store["profiles"][DEFAULT_PROFILE_NAME] = get_settings_dict()
     store["app_settings"] = get_app_settings_dict()
     save_settings(show_popup=False)
@@ -1504,6 +2464,8 @@ def start_capture():
     try:
         validate_inputs()
         cmd = build_powershell_command()
+        if not confirm_case_folder_collision():
+            return
         save_settings(show_popup=False)
     except Exception as e:
         messagebox.showerror("Input error", str(e))
@@ -1518,9 +2480,20 @@ def start_capture():
         if not proceed:
             return
 
+    copy_summary_button.config(state="disabled")
     log_box.delete("1.0", "end")
     append_log("Starting capture...\n\n")
     append_log(f"Settings saved to: {SETTINGS_FILE}\n\n")
+
+    tool_versions = query_capture_tool_versions_for_log()
+    log_capture_tool_versions(tool_versions)
+
+    global last_capture_context
+    last_capture_context = {
+        "tool_versions": tool_versions,
+        "submitted_url_count": count_submitted_urls(),
+    }
+
     append_log("Command:\n")
     append_log(" ".join(f'"{part}"' if " " in part else part for part in cmd))
     append_log("\n\n")
@@ -1572,6 +2545,8 @@ def start_capture():
 
 
 def show_run_summary(exit_code, submitted_url_count):
+    global last_successful_case_summary
+
     try:
         paths = get_expected_run_paths()
     except Exception:
@@ -1581,6 +2556,8 @@ def show_run_summary(exit_code, submitted_url_count):
     append_log(f"Exit code: {exit_code}\n")
     append_log(f"Submitted URLs: {submitted_url_count}\n")
 
+    counts = {}
+
     if paths:
         append_log(f"Case folder: {paths['case_folder']}\n")
         append_log(f"Media folder: {paths['media_folder']}\n")
@@ -1588,25 +2565,29 @@ def show_run_summary(exit_code, submitted_url_count):
         append_log(f"Manifests folder: {paths['manifests_folder']}\n")
         append_log(f"Download archive: {paths['download_archive']}\n")
 
-        manifest_count = 0
-        if os.path.isdir(paths["manifests_folder"]):
-            manifest_count = len([
-                name for name in os.listdir(paths["manifests_folder"])
-                if name.lower().endswith(".csv")
-            ])
-
-        log_count = 0
-        if os.path.isdir(paths["logs_folder"]):
-            log_count = len([
-                name for name in os.listdir(paths["logs_folder"])
-                if name.lower().endswith(".log")
-            ])
-
-        append_log(f"Manifest CSV files found: {manifest_count}\n")
-        append_log(f"Run log files found: {log_count}\n")
+        counts = count_case_files(paths["case_folder"])
+        append_log(f"Total files found: {counts.get('files', 0)}\n")
+        append_log(f"Media files found: {counts.get('media', 0)}\n")
+        append_log(f"Metadata JSON files found: {counts.get('metadata', 0)}\n")
+        append_log(f"Manifest files found: {counts.get('manifests', 0)}\n")
+        append_log(f"Run log files found: {counts.get('logs', 0)}\n")
 
     append_log("=================================\n")
 
+    if exit_code == 0 and paths:
+        versions = last_capture_context.get("tool_versions", {})
+        last_successful_case_summary = build_case_summary_text(
+            exit_code,
+            submitted_url_count,
+            paths,
+            versions,
+            counts,
+        )
+        copy_summary_button.config(state="normal")
+        append_log("Case summary is available. Use Copy Case Summary to copy it to the clipboard.\n")
+    else:
+        last_successful_case_summary = ""
+        copy_summary_button.config(state="disabled")
 
 def stop_capture():
     global running_process
@@ -1851,6 +2832,216 @@ def check_ytdlp_version():
             root.after(0, append_log, f"yt-dlp version check error: {e}\n")
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+def normalize_version_for_compare(value):
+    value = (value or "").strip()
+
+    if value.lower().startswith("v"):
+        value = value[1:]
+
+    parts = []
+    for token in re.split(r"[^0-9]+", value):
+        if token:
+            try:
+                parts.append(int(token))
+            except Exception:
+                pass
+
+    return tuple(parts)
+
+
+def fetch_latest_app_release():
+    req = urllib.request.Request(
+        APP_GITHUB_LATEST_API_URL,
+        headers={
+            "User-Agent": "ytdlp-gui-for-osint",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+
+    with urllib.request.urlopen(req, timeout=30) as response:
+        release = json.loads(response.read().decode("utf-8"))
+
+    return {
+        "tag": release.get("tag_name", "") or release.get("name", ""),
+        "name": release.get("name", ""),
+        "published": release.get("published_at", ""),
+        "body": release.get("body", ""),
+        "url": release.get("html_url", APP_RELEASES_LATEST_URL),
+    }
+
+
+def open_about_dialog():
+    dialog = tk.Toplevel(root)
+    dialog.title("About yt-dlp GUI for OSINT")
+    dialog.resizable(False, False)
+    dialog.transient(root)
+    dialog.grab_set()
+
+    frame = ttk.Frame(dialog, padding=16)
+    frame.pack(fill="both", expand=True)
+
+    ttk.Label(
+        frame,
+        text=APP_TITLE,
+        font=("Segoe UI", 12, "bold"),
+    ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+    ttk.Label(
+        frame,
+        text=f"Version: {APP_VERSION}",
+    ).grid(row=1, column=0, sticky="w", pady=(0, 12))
+
+    ttk.Label(
+        frame,
+        text=(
+            "A portable Windows GUI for running an approved yt-dlp capture workflow "
+            "for OSINT-style collection and review.\n\n"
+            "This app does not bundle yt-dlp, FFmpeg, Deno, or other binaries. "
+            "Use official, signed, organization-approved binaries where required."
+        ),
+        wraplength=520,
+        justify="left",
+    ).grid(row=2, column=0, sticky="w", pady=(0, 12))
+
+    ttk.Label(
+        frame,
+        text="Repository:",
+    ).grid(row=3, column=0, sticky="w", pady=(0, 2))
+
+    repo_url = "https://github.com/jmashuque/ytdlp-gui-for-osint"
+    repo_label = ttk.Label(
+        frame,
+        text=repo_url,
+        cursor="hand2",
+        foreground="blue",
+    )
+    repo_label.grid(row=4, column=0, sticky="w", pady=(0, 14))
+    repo_label.bind("<Button-1>", lambda event: webbrowser.open(repo_url))
+
+    button_frame = ttk.Frame(frame)
+    button_frame.grid(row=5, column=0, sticky="e")
+
+    ttk.Button(
+        button_frame,
+        text="Open Repository",
+        command=lambda: webbrowser.open(repo_url),
+    ).pack(side="left", padx=(0, 8))
+
+    ttk.Button(
+        button_frame,
+        text="Close",
+        command=dialog.destroy,
+    ).pack(side="left")
+
+
+def open_app_update_dialog():
+    dialog = tk.Toplevel(root)
+    dialog.title("Check for App Updates")
+    dialog.geometry("700x460")
+    dialog.minsize(640, 420)
+    dialog.transient(root)
+    dialog.grab_set()
+
+    current_version_var = tk.StringVar(value=f"Current version: {APP_VERSION}")
+    latest_version_var = tk.StringVar(value="Latest GitHub release: checking...")
+    status_var_local = tk.StringVar(value="Querying latest release from GitHub...")
+    latest_release_url_var = tk.StringVar(value=APP_RELEASES_LATEST_URL)
+
+    frame = ttk.Frame(dialog, padding=12)
+    frame.pack(fill="both", expand=True)
+    frame.columnconfigure(0, weight=1)
+    frame.rowconfigure(4, weight=1)
+
+    ttk.Label(
+        frame,
+        text=(
+            "This checker only queries the latest GitHub release and opens the release page for manual download. "
+            "It does not download, extract, replace, or run files."
+        ),
+        wraplength=660,
+        justify="left",
+    ).grid(row=0, column=0, sticky="ew", pady=(0, 12))
+
+    ttk.Label(frame, textvariable=current_version_var).grid(row=1, column=0, sticky="w", pady=3)
+    ttk.Label(frame, textvariable=latest_version_var).grid(row=2, column=0, sticky="w", pady=3)
+    ttk.Label(frame, textvariable=status_var_local, wraplength=660, justify="left").grid(row=3, column=0, sticky="ew", pady=(6, 8))
+
+    release_notes = scrolledtext.ScrolledText(frame, height=10, wrap="word")
+    release_notes.grid(row=4, column=0, sticky="nsew", pady=(0, 10))
+    release_notes.insert("1.0", "Release notes will appear here if available.")
+    release_notes.config(state="disabled")
+
+    button_frame = ttk.Frame(frame)
+    button_frame.grid(row=5, column=0, sticky="e")
+
+    def set_release_notes(text_value):
+        release_notes.config(state="normal")
+        release_notes.delete("1.0", "end")
+        release_notes.insert("1.0", text_value or "No release notes provided.")
+        release_notes.config(state="disabled")
+
+    def open_latest_release_page():
+        webbrowser.open(latest_release_url_var.get() or APP_RELEASES_LATEST_URL)
+
+    def query_latest_release():
+        status_var_local.set("Querying latest release from GitHub...")
+        latest_version_var.set("Latest GitHub release: checking...")
+        set_release_notes("Querying GitHub...")
+
+        def worker():
+            try:
+                release = fetch_latest_app_release()
+                tag = release.get("tag") or "unknown"
+                url = release.get("url") or APP_RELEASES_LATEST_URL
+                published = release.get("published") or "unknown"
+                body = release.get("body") or "No release notes provided."
+
+                latest_release_url_var.set(url)
+
+                current_tuple = normalize_version_for_compare(APP_VERSION)
+                latest_tuple = normalize_version_for_compare(tag)
+
+                if latest_tuple and current_tuple and latest_tuple > current_tuple:
+                    status_text = "A newer release appears to be available. Open the release page to manually download the latest ZIP."
+                elif latest_tuple and current_tuple and latest_tuple == current_tuple:
+                    status_text = "You appear to be on the latest tagged release."
+                else:
+                    status_text = "Latest release was found. Review the release page to confirm whether an update is needed."
+
+                def update_ui():
+                    latest_version_var.set(f"Latest GitHub release: {tag}    Published: {published}")
+                    status_var_local.set(status_text)
+                    set_release_notes(body)
+                    append_log(
+                        "\nChecked app updates from GitHub.\n"
+                        f"Current version: {APP_VERSION}\n"
+                        f"Latest release: {tag}\n"
+                        f"Release page: {url}\n"
+                    )
+
+                root.after(0, update_ui)
+
+            except Exception as e:
+                error_message = str(e)
+
+                def show_error():
+                    latest_version_var.set("Latest GitHub release: unavailable")
+                    status_var_local.set(f"Could not query latest GitHub release: {error_message}")
+                    set_release_notes("Could not retrieve release notes.")
+                    append_log(f"\nFailed to check app updates: {error_message}\n")
+                    messagebox.showerror("Update check failed", error_message)
+
+                root.after(0, show_error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    ttk.Button(button_frame, text="Recheck", command=query_latest_release).pack(side="left", padx=6)
+    ttk.Button(button_frame, text="Open Latest Release Page", command=open_latest_release_page).pack(side="left", padx=6)
+    ttk.Button(button_frame, text="Close", command=dialog.destroy).pack(side="left", padx=6)
+
+    query_latest_release()
 
 
 def fetch_ytdlp_nightly_releases(limit=30):
@@ -3337,17 +4528,116 @@ def open_case_browser():
 
     right_frame = ttk.Frame(paned)
     right_frame.columnconfigure(0, weight=1)
-    right_frame.rowconfigure(1, weight=1)
+    right_frame.rowconfigure(2, weight=1)
 
     browser_status_var = tk.StringVar(value="Select a folder to view captured files.")
+    browser_filter_var = case_browser_filter_var
+    browser_sort_var = case_browser_sort_var
+    browser_current_only_var = case_browser_current_only_var
+    browser_icon_scale_var = case_browser_icon_scale_var
+
+    def save_case_browser_preferences():
+        save_app_settings(show_popup=False)
+
+    def refresh_browser_view():
+        save_case_browser_preferences()
+        try:
+            render_files(get_selected_browser_folder())
+        except NameError:
+            # During window construction, render_files/get_selected_browser_folder are defined later.
+            pass
+
+    def get_browser_icon_geometry():
+        scale = browser_icon_scale_var.get()
+
+        if scale == "Small":
+            return {
+                "thumb_w": 120,
+                "thumb_h": 76,
+                "card_w": 150,
+                "wrap": 130,
+                "label_width": 20,
+                "columns": 6,
+                "font_big": 12,
+                "font_small": 8,
+            }
+
+        if scale == "Large":
+            return {
+                "thumb_w": 220,
+                "thumb_h": 138,
+                "card_w": 260,
+                "wrap": 230,
+                "label_width": 34,
+                "columns": 3,
+                "font_big": 18,
+                "font_small": 10,
+            }
+
+        return {
+            "thumb_w": 160,
+            "thumb_h": 100,
+            "card_w": 200,
+            "wrap": 170,
+            "label_width": 24,
+            "columns": 4,
+            "font_big": 14,
+            "font_small": 9,
+        }
+
     ttk.Label(right_frame, textvariable=browser_status_var).grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
+    browser_controls = ttk.Frame(right_frame)
+    browser_controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+    browser_controls.columnconfigure(5, weight=1)
+
+    ttk.Label(browser_controls, text="Filter").grid(row=0, column=0, sticky="w", padx=(0, 4))
+    filter_menu = ttk.Combobox(
+        browser_controls,
+        textvariable=browser_filter_var,
+        values=["All", "Media", "Video", "Audio", "Metadata/JSON", "Logs/Text", "Subtitles", "Images", "URL shortcuts"],
+        state="readonly",
+        width=16,
+    )
+    filter_menu.grid(row=0, column=1, sticky="w", padx=(0, 8))
+
+    ttk.Label(browser_controls, text="Sort").grid(row=0, column=2, sticky="w", padx=(0, 4))
+    sort_menu = ttk.Combobox(
+        browser_controls,
+        textvariable=browser_sort_var,
+        values=["Name", "Type", "Size", "Newest", "Oldest"],
+        state="readonly",
+        width=10,
+    )
+    sort_menu.grid(row=0, column=3, sticky="w", padx=(0, 8))
+
+    ttk.Checkbutton(
+        browser_controls,
+        text="Current folder only",
+        variable=browser_current_only_var,
+        command=refresh_browser_view,
+    ).grid(row=0, column=4, sticky="w", padx=(0, 8))
+
+    ttk.Label(browser_controls, text="Icon scale").grid(row=0, column=5, sticky="e", padx=(8, 4))
+    scale_menu = ttk.Combobox(
+        browser_controls,
+        textvariable=browser_icon_scale_var,
+        values=["Small", "Medium", "Large"],
+        state="readonly",
+        width=9,
+    )
+    scale_menu.grid(row=0, column=6, sticky="e")
+
     canvas = tk.Canvas(right_frame, highlightthickness=0)
-    canvas.grid(row=1, column=0, sticky="nsew")
+    canvas.grid(row=2, column=0, sticky="nsew")
 
     y_scroll = ttk.Scrollbar(right_frame, orient="vertical", command=canvas.yview)
-    y_scroll.grid(row=1, column=1, sticky="ns")
-    canvas.configure(yscrollcommand=y_scroll.set)
+    y_scroll.grid(row=2, column=1, sticky="ns")
+
+    x_scroll = ttk.Scrollbar(right_frame, orient="horizontal", command=canvas.xview)
+    x_scroll.grid(row=3, column=0, sticky="ew")
+
+    canvas.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
 
     content_frame = ttk.Frame(canvas)
     content_window = canvas.create_window((0, 0), window=content_frame, anchor="nw")
@@ -3356,7 +4646,8 @@ def open_case_browser():
         canvas.configure(scrollregion=canvas.bbox("all"))
 
     def configure_canvas(event):
-        canvas.itemconfigure(content_window, width=event.width)
+        # Keep the content frame at its natural requested width so horizontal scrolling works.
+        canvas.configure(scrollregion=canvas.bbox("all"))
 
     content_frame.bind("<Configure>", configure_content)
     canvas.bind("<Configure>", configure_canvas)
@@ -3390,11 +4681,70 @@ def open_case_browser():
         if os.path.isfile(path):
             os.startfile(path)
 
-    def make_placeholder(parent, extension, width=160, height=100):
+    def open_containing_folder(path):
+        folder = os.path.dirname(path)
+        if os.path.isdir(folder):
+            os.startfile(folder)
+
+    def copy_text_to_clipboard(value, label="Text"):
+        root.clipboard_clear()
+        root.clipboard_append(value)
+        append_log(f"\n{label} copied to clipboard.\n")
+
+    def find_related_file(path, extensions):
+        base, _ = os.path.splitext(path)
+        for extension in extensions:
+            candidate = base + extension
+            if os.path.isfile(candidate):
+                return candidate
+        return ""
+
+    def open_related_metadata(path):
+        related = find_related_file(path, [".info.json", ".json"])
+        if related:
+            os.startfile(related)
+        else:
+            messagebox.showinfo("No related metadata", "No related metadata JSON file was found beside this item.")
+
+    def open_related_source_link(path):
+        related = find_related_file(path, [".url", ".webloc"])
+        if related:
+            os.startfile(related)
+        else:
+            messagebox.showinfo("No related source link", "No related URL shortcut was found beside this item.")
+
+    def show_file_context_menu(event, path, folder_path):
+        menu = tk.Menu(browser, tearoff=0)
+        menu.add_command(label="Open", command=lambda: open_selected_file(path))
+        menu.add_command(label="Open Containing Folder", command=lambda: open_containing_folder(path))
+        menu.add_separator()
+        menu.add_command(label="Open Related Metadata JSON", command=lambda: open_related_metadata(path))
+        menu.add_command(label="Open Related Source Link", command=lambda: open_related_source_link(path))
+        menu.add_separator()
+        menu.add_command(label="Copy Full Path", command=lambda: copy_text_to_clipboard(path, "Full path"))
+        menu.add_command(label="Copy File Name", command=lambda: copy_text_to_clipboard(os.path.basename(path), "File name"))
+        try:
+            rel_path = os.path.relpath(path, folder_path)
+        except Exception:
+            rel_path = path
+        menu.add_command(label="Copy Relative Path", command=lambda: copy_text_to_clipboard(rel_path, "Relative path"))
+
+        try:
+            colors = get_theme_colors()
+            configure_menu_theme(menu, colors)
+        except Exception:
+            pass
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def make_placeholder(parent, extension, width=160, height=100, font_big=14, font_small=9):
         placeholder = tk.Canvas(parent, width=width, height=height, highlightthickness=1, relief="ridge")
         placeholder.create_rectangle(0, 0, width, height)
-        placeholder.create_text(width // 2, height // 2 - 8, text=(extension or "FILE").upper(), font=("Segoe UI", 14, "bold"))
-        placeholder.create_text(width // 2, height // 2 + 16, text="No preview", font=("Segoe UI", 9))
+        placeholder.create_text(width // 2, height // 2 - 8, text=(extension or "FILE").upper(), font=("Segoe UI", font_big, "bold"))
+        placeholder.create_text(width // 2, height // 2 + 18, text="No preview", font=("Segoe UI", font_small))
         return placeholder
 
     def clear_content():
@@ -3402,23 +4752,77 @@ def open_case_browser():
             child.destroy()
         image_refs.clear()
 
+    def file_matches_browser_filter(path):
+        ext = os.path.splitext(path)[1].lower()
+        selected_filter = browser_filter_var.get()
+
+        if selected_filter == "All":
+            return is_browser_media_file(path) or ext in {".json", ".txt", ".description", ".url", ".webloc", ".srt", ".vtt", ".png", ".jpg", ".jpeg", ".webp", ".log", ".csv"}
+
+        if selected_filter == "Media":
+            return is_browser_media_file(path)
+
+        if selected_filter == "Video":
+            return is_browser_video_file(path)
+
+        if selected_filter == "Audio":
+            return ext in {".mp3", ".m4a", ".opus", ".wav", ".aac", ".flac"}
+
+        if selected_filter == "Metadata/JSON":
+            return ext in {".json", ".csv"}
+
+        if selected_filter == "Logs/Text":
+            return ext in {".log", ".txt", ".description"}
+
+        if selected_filter == "Subtitles":
+            return ext in {".srt", ".vtt"}
+
+        if selected_filter == "Images":
+            return ext in {".png", ".jpg", ".jpeg", ".webp"}
+
+        if selected_filter == "URL shortcuts":
+            return ext in {".url", ".webloc"}
+
+        return True
+
     def list_display_files(folder_path):
         display_files = []
 
-        for root_dir, dir_names, file_names in os.walk(folder_path):
-            dir_names[:] = [
-                name for name in dir_names
-                if name.lower() not in {".gui-cache", "__pycache__"}
-            ]
+        if browser_current_only_var.get():
+            try:
+                names = os.listdir(folder_path)
+            except Exception:
+                names = []
 
-            for file_name in file_names:
-                path = os.path.join(root_dir, file_name)
-                ext = os.path.splitext(file_name)[1].lower()
-
-                if is_browser_media_file(path) or ext in {".json", ".txt", ".description", ".url", ".webloc", ".srt", ".vtt", ".png", ".jpg", ".jpeg", ".webp"}:
+            for name in names:
+                path = os.path.join(folder_path, name)
+                if os.path.isfile(path) and file_matches_browser_filter(path):
                     display_files.append(path)
+        else:
+            for root_dir, dir_names, file_names in os.walk(folder_path):
+                dir_names[:] = [
+                    name for name in dir_names
+                    if name.lower() not in {".gui-cache", "__pycache__"}
+                ]
 
-        display_files.sort(key=lambda p: (not is_browser_media_file(p), os.path.basename(p).lower()))
+                for file_name in file_names:
+                    path = os.path.join(root_dir, file_name)
+                    if file_matches_browser_filter(path):
+                        display_files.append(path)
+
+        sort_mode = browser_sort_var.get()
+
+        if sort_mode == "Type":
+            display_files.sort(key=lambda p: (os.path.splitext(p)[1].lower(), os.path.basename(p).lower()))
+        elif sort_mode == "Size":
+            display_files.sort(key=lambda p: (-(os.path.getsize(p) if os.path.isfile(p) else 0), os.path.basename(p).lower()))
+        elif sort_mode == "Newest":
+            display_files.sort(key=lambda p: (-(os.path.getmtime(p) if os.path.isfile(p) else 0), os.path.basename(p).lower()))
+        elif sort_mode == "Oldest":
+            display_files.sort(key=lambda p: ((os.path.getmtime(p) if os.path.isfile(p) else 0), os.path.basename(p).lower()))
+        else:
+            display_files.sort(key=lambda p: (not is_browser_media_file(p), os.path.basename(p).lower()))
+
         return display_files
 
     def render_files(folder_path):
@@ -3431,19 +4835,24 @@ def open_case_browser():
             ttk.Label(content_frame, text="No media or sidecar files found in this folder.").grid(row=0, column=0, sticky="w", padx=12, pady=12)
             return
 
-        columns = 4
+        geometry = get_browser_icon_geometry()
+        columns = geometry["columns"]
+        thumb_w = geometry["thumb_w"]
+        thumb_h = geometry["thumb_h"]
+        wrap = geometry["wrap"]
+        label_width = geometry["label_width"]
 
         for index, path in enumerate(files):
             row = index // columns
             column = index % columns
 
-            card = ttk.Frame(content_frame, padding=8, relief="ridge")
-            card.grid(row=row, column=column, sticky="n", padx=8, pady=8)
+            card = ttk.Frame(content_frame, padding=10, relief="ridge")
+            card.grid(row=row, column=column, sticky="n", padx=10, pady=10)
 
             ext = os.path.splitext(path)[1].lower().lstrip(".")
             thumb_loaded = False
             info_summary = None
-            tooltip_text = f"{os.path.basename(path)}\n\nDouble-click to open."
+            tooltip_text = f"{os.path.basename(path)}\n\nDouble-click to open. Right-click for actions."
 
             if is_browser_media_file(path):
                 media_info = load_or_generate_media_info(path)
@@ -3455,26 +4864,33 @@ def open_case_browser():
                 if thumb_path and os.path.isfile(thumb_path):
                     try:
                         image = tk.PhotoImage(file=thumb_path)
-                        if image.width() > 180:
-                            factor = max(1, int(image.width() / 160))
+                        if image.width() > thumb_w or image.height() > thumb_h:
+                            factor = max(1, int(max(image.width() / thumb_w, image.height() / thumb_h)))
                             image = image.subsample(factor, factor)
                         image_refs.append(image)
-                        thumb = tk.Canvas(card, width=160, height=100, highlightthickness=1, relief="ridge")
-                        thumb.create_image(80, 50, image=image, anchor="center")
+                        thumb = tk.Canvas(card, width=thumb_w, height=thumb_h, highlightthickness=1, relief="ridge")
+                        thumb.create_image(thumb_w // 2, thumb_h // 2, image=image, anchor="center")
                         thumb_loaded = True
                     except Exception:
                         thumb_loaded = False
 
             if not thumb_loaded:
-                thumb = make_placeholder(card, ext or "file")
+                thumb = make_placeholder(
+                    card,
+                    ext or "file",
+                    width=thumb_w,
+                    height=thumb_h,
+                    font_big=geometry["font_big"],
+                    font_small=geometry["font_small"],
+                )
 
             thumb.grid(row=0, column=0, pady=(0, 6))
 
-            name_label = ttk.Label(card, text=os.path.basename(path), width=24, wraplength=160, justify="center")
+            name_label = ttk.Label(card, text=os.path.basename(path), width=label_width, wraplength=wrap, justify="center")
             name_label.grid(row=1, column=0)
 
             if info_summary:
-                info_label = ttk.Label(card, text=info_summary["card"], width=24, wraplength=160, justify="center")
+                info_label = ttk.Label(card, text=info_summary["card"], width=label_width, wraplength=wrap, justify="center")
                 info_label.grid(row=2, column=0)
                 rel_row = 3
             else:
@@ -3486,7 +4902,7 @@ def open_case_browser():
             except Exception:
                 rel_path = path
 
-            type_label = ttk.Label(card, text=rel_path, width=24, wraplength=160, justify="center")
+            type_label = ttk.Label(card, text=rel_path, width=label_width, wraplength=wrap, justify="center")
             type_label.grid(row=rel_row, column=0)
 
             widgets = [card, thumb, name_label, type_label]
@@ -3495,6 +4911,8 @@ def open_case_browser():
 
             for widget in widgets:
                 widget.bind("<Double-Button-1>", lambda event, p=path: open_selected_file(p))
+                widget.bind("<Button-3>", lambda event, p=path, fp=folder_path: show_file_context_menu(event, p, fp))
+                widget.bind("<Button-2>", lambda event, p=path, fp=folder_path: show_file_context_menu(event, p, fp))
                 Tooltip(widget, tooltip_text)
 
         configure_content()
@@ -3538,6 +4956,116 @@ def open_case_browser():
         else:
             messagebox.showwarning("Folder not found", f"The selected folder does not exist:\n\n{folder_path}")
 
+    def get_case_root_for_browser_folder(folder_path):
+        try:
+            output_root_abs = os.path.abspath(output_root)
+            folder_abs = os.path.abspath(folder_path)
+            if os.path.commonpath([output_root_abs, folder_abs]) == output_root_abs:
+                rel = os.path.relpath(folder_abs, output_root_abs)
+                first_part = rel.split(os.sep)[0]
+                if first_part and first_part not in {".", ".."}:
+                    return os.path.join(output_root_abs, first_part)
+        except Exception:
+            pass
+
+        return folder_path
+
+    def find_latest_manifest(case_root):
+        candidates = []
+        search_roots = [
+            os.path.join(case_root, "manifests"),
+            case_root,
+        ]
+
+        for search_root in search_roots:
+            if not os.path.isdir(search_root):
+                continue
+
+            for root_dir, dir_names, file_names in os.walk(search_root):
+                for file_name in file_names:
+                    lowered = file_name.lower()
+                    if lowered.startswith("sha256-manifest") and lowered.endswith(".csv"):
+                        path = os.path.join(root_dir, file_name)
+                        candidates.append(path)
+
+        if not candidates:
+            return ""
+
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return candidates[0]
+
+    def verify_case_files():
+        folder_path = get_selected_browser_folder()
+        case_root = get_case_root_for_browser_folder(folder_path)
+        manifest_path = find_latest_manifest(case_root)
+
+        if not manifest_path:
+            messagebox.showwarning(
+                "No manifest found",
+                f"No SHA256 manifest was found for:\n\n{case_root}",
+            )
+            return
+
+        ok_count = 0
+        missing = []
+        changed = []
+        manifest_paths = set()
+
+        try:
+            with open(manifest_path, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    path = row.get("Path", "")
+                    expected_hash = (row.get("Hash", "") or "").upper()
+
+                    if not path:
+                        continue
+
+                    manifest_paths.add(os.path.abspath(path))
+
+                    if not os.path.isfile(path):
+                        missing.append(path)
+                        continue
+
+                    try:
+                        h = hashlib.sha256()
+                        with open(path, "rb") as input_file_obj:
+                            for chunk in iter(lambda: input_file_obj.read(1024 * 1024), b""):
+                                h.update(chunk)
+                        actual_hash = h.hexdigest().upper()
+                    except Exception:
+                        changed.append(path)
+                        continue
+
+                    if actual_hash == expected_hash:
+                        ok_count += 1
+                    else:
+                        changed.append(path)
+
+            untracked_count = 0
+            for root_dir, dir_names, file_names in os.walk(case_root):
+                dir_names[:] = [name for name in dir_names if name.lower() not in {"__pycache__"}]
+                for file_name in file_names:
+                    path = os.path.abspath(os.path.join(root_dir, file_name))
+                    if path == os.path.abspath(manifest_path):
+                        continue
+                    if path not in manifest_paths:
+                        untracked_count += 1
+
+            summary = (
+                f"Manifest:\n{manifest_path}\n\n"
+                f"Verified unchanged: {ok_count}\n"
+                f"Missing: {len(missing)}\n"
+                f"Changed/unreadable: {len(changed)}\n"
+                f"New/untracked since manifest: {untracked_count}\n"
+            )
+
+            append_log("\nCase file verification:\n" + summary + "\n")
+            messagebox.showinfo("Case file verification", summary)
+
+        except Exception as e:
+            messagebox.showerror("Verification failed", f"Could not verify case files:\n\n{e}")
+
     def refresh_tree():
         for item in tree.get_children(""):
             tree.delete(item)
@@ -3550,8 +5078,12 @@ def open_case_browser():
         browser_status_var.set("Case tree refreshed. Select a folder to view captured files.")
 
     tree.bind("<<TreeviewSelect>>", on_tree_select)
+    filter_menu.bind("<<ComboboxSelected>>", lambda event: refresh_browser_view())
+    sort_menu.bind("<<ComboboxSelected>>", lambda event: refresh_browser_view())
+    scale_menu.bind("<<ComboboxSelected>>", lambda event: refresh_browser_view())
 
     ttk.Button(top_bar, text="Refresh", command=refresh_tree).pack(side="right", padx=(6, 0))
+    ttk.Button(top_bar, text="Verify Case Files", command=verify_case_files).pack(side="right", padx=(6, 0))
     ttk.Button(top_bar, text="Open Folder", command=open_selected_browser_folder).pack(side="right", padx=(6, 0))
     ttk.Button(top_bar, text="Open Output Root", command=lambda: os.startfile(output_root)).pack(side="right", padx=(6, 0))
 
@@ -3589,6 +5121,10 @@ def on_close():
 
 
 root = tk.Tk()
+try:
+    ORIGINAL_TTK_THEME = ttk.Style(root).theme_use()
+except Exception:
+    ORIGINAL_TTK_THEME = ""
 root.title(f"{APP_TITLE} - Profile: {DEFAULT_PROFILE_NAME}")
 root.geometry("1180x900")
 root.minsize(1050, 780)
@@ -3597,6 +5133,7 @@ script_path_var = tk.StringVar(value=DEFAULTS["script_path"])
 yt_dlp_path_var = tk.StringVar(value=DEFAULTS["yt_dlp_path"])
 input_file_var = tk.StringVar(value=DEFAULTS["input_file"])
 case_name_var = tk.StringVar(value=DEFAULTS["case_name"])
+case_folder_preview_var = tk.StringVar(value="")
 cookies_file_var = tk.StringVar(value=DEFAULTS["cookies_file"])
 output_root_var = tk.StringVar(value=DEFAULTS["output_root"])
 ffmpeg_folder_var = tk.StringVar(value=DEFAULTS["ffmpeg_folder"])
@@ -3610,6 +5147,11 @@ yt_dlp_version_status_var = tk.StringVar(value="yt-dlp: not checked")
 preflight_done_var = tk.BooleanVar(value=False)
 delete_cookies_on_exit_var = tk.BooleanVar(value=APP_SETTINGS_DEFAULTS["delete_cookies_on_exit"])
 check_vpn_var = tk.BooleanVar(value=APP_SETTINGS_DEFAULTS["check_vpn"])
+dark_mode_var = tk.BooleanVar(value=APP_SETTINGS_DEFAULTS["dark_mode"])
+case_browser_filter_var = tk.StringVar(value=APP_SETTINGS_DEFAULTS["case_browser_filter"])
+case_browser_sort_var = tk.StringVar(value=APP_SETTINGS_DEFAULTS["case_browser_sort"])
+case_browser_current_only_var = tk.BooleanVar(value=APP_SETTINGS_DEFAULTS["case_browser_current_only"])
+case_browser_icon_scale_var = tk.StringVar(value=APP_SETTINGS_DEFAULTS["case_browser_icon_scale"])
 selected_profile_var = tk.StringVar(value=DEFAULT_PROFILE_NAME)
 capture_options_summary_var = tk.StringVar(value="")
 capture_mode_var = tk.StringVar(value=DEFAULTS["capture_mode"])
@@ -3746,17 +5288,32 @@ settings_menu.add_separator()
 settings_menu.add_checkbutton(
     label="Delete Cookies on Exit",
     variable=delete_cookies_on_exit_var,
-    command=lambda: save_app_settings(show_popup=False),
+    command=lambda: save_app_settings(
+        show_popup=False,
+        changed_setting_label=f"Delete Cookies on Exit {'enabled' if delete_cookies_on_exit_var.get() else 'disabled'}",
+    ),
 )
 settings_menu.add_checkbutton(
     label="Check VPN",
     variable=check_vpn_var,
     command=toggle_check_vpn_setting,
 )
+settings_menu.add_checkbutton(
+    label="Dark Mode",
+    variable=dark_mode_var,
+    command=toggle_dark_mode_setting,
+)
 settings_menu.add_separator()
 settings_menu.add_command(label="Reset Defaults", command=reset_defaults)
 settings_menu.add_separator()
 settings_menu.add_command(label="Save Default Portable Settings", command=lambda: save_settings(show_popup=True))
+settings_menu.add_separator()
+settings_menu.add_command(label="Delete Settings File...", command=delete_settings_file)
+
+help_menu = tk.Menu(menu_bar, tearoff=0)
+menu_bar.add_cascade(label="Help", menu=help_menu)
+help_menu.add_command(label="Check for Updates", command=open_app_update_dialog)
+help_menu.add_command(label="About", command=open_about_dialog)
 
 add_file_row(0, "Script Path", script_path_var)
 
@@ -3801,12 +5358,46 @@ ttk.Label(
 
 add_file_row(2, "Input File", input_file_var)
 
-ttk.Label(main, text="Case Name").grid(row=3, column=0, sticky="w", pady=3)
+ttk.Label(main, text="Case Name").grid(row=3, column=0, sticky="nw", pady=(6, 3))
 case_name_frame = ttk.Frame(main)
 case_name_frame.grid(row=3, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
 case_name_frame.columnconfigure(0, weight=1)
-ttk.Entry(case_name_frame, textvariable=case_name_var).grid(row=0, column=0, sticky="ew", padx=(0, 6))
-ttk.Button(case_name_frame, text="Open", command=open_current_case_folder).grid(row=0, column=1, sticky="e")
+
+case_name_entry = ttk.Entry(case_name_frame, textvariable=case_name_var)
+case_name_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+case_folder_preview_label = ttk.Label(
+    case_name_frame,
+    textvariable=case_folder_preview_var,
+    wraplength=760,
+    justify="left",
+)
+case_folder_preview_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 0))
+
+case_tag_menu_button = ttk.Menubutton(case_name_frame, text="Insert Tag")
+case_tag_menu = tk.Menu(case_tag_menu_button, tearoff=0)
+case_tag_menu_button["menu"] = case_tag_menu
+
+case_name_tag_items = [
+    ("%date%", "Date, e.g. 2026-05-27"),
+    ("%time%", "Time, e.g. 14-30-05"),
+    ("%datetime%", "Date and time, e.g. 2026-05-27_14-30-05"),
+    ("%year%", "Year"),
+    ("%month%", "Month"),
+    ("%day%", "Day"),
+    ("%hour%", "Hour"),
+    ("%minute%", "Minute"),
+    ("%second%", "Second"),
+]
+
+for tag, description in case_name_tag_items:
+    case_tag_menu.add_command(
+        label=f"{tag}    {description}",
+        command=lambda value=tag: insert_case_name_tag(value),
+    )
+
+case_tag_menu_button.grid(row=0, column=1, sticky="e", padx=(0, 6))
+ttk.Button(case_name_frame, text="Open", command=open_current_case_folder).grid(row=0, column=2, sticky="e")
 
 add_file_row(4, "Cookies File", cookies_file_var)
 add_folder_row(5, "Output Root", output_root_var)
@@ -3921,12 +5512,28 @@ urls_text.grid(row=12, column=0, columnspan=3, sticky="nsew", pady=(0, 8))
 workflow_frame = ttk.Frame(main)
 workflow_frame.grid(row=13, column=0, columnspan=3, sticky="ew", pady=(8, 12))
 workflow_frame.columnconfigure(0, weight=1)
-workflow_frame.columnconfigure(1, weight=1)
+workflow_frame.columnconfigure(1, weight=0)
 workflow_frame.columnconfigure(2, weight=1)
 workflow_frame.columnconfigure(3, weight=1)
+workflow_frame.columnconfigure(4, weight=1)
 
-preflight_button = ttk.Button(workflow_frame, text="Preflight Check", command=run_preflight_check)
-preflight_button.grid(row=0, column=0, sticky="ew", padx=(0, 8), ipady=5)
+main_action_button_style = {
+    "font": ("Segoe UI", 10, "bold"),
+    "padx": 10,
+    "pady": 5,
+    "relief": "raised",
+    "borderwidth": 2,
+}
+
+preflight_button = tk.Button(
+    workflow_frame,
+    text="✓ Preflight Check",
+    command=run_preflight_check,
+    fg="#003366",
+    activeforeground="#003366",
+    **main_action_button_style,
+)
+preflight_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
 
 preflight_check_box = ttk.Checkbutton(
     workflow_frame,
@@ -3941,9 +5548,7 @@ start_button = tk.Button(
     text="▶ Start Capture",
     command=start_capture,
     fg="green",
-    font=("Segoe UI", 10, "bold"),
-    padx=10,
-    pady=5,
+    **main_action_button_style,
 )
 start_button.grid(row=0, column=2, sticky="ew", padx=(0, 8))
 
@@ -3952,12 +5557,21 @@ stop_button = tk.Button(
     text="■ Stop",
     command=stop_capture,
     fg="red",
-    font=("Segoe UI", 10, "bold"),
-    padx=10,
-    pady=5,
     state="disabled",
+    **main_action_button_style,
 )
-stop_button.grid(row=0, column=3, sticky="ew")
+stop_button.grid(row=0, column=3, sticky="ew", padx=(0, 8))
+
+copy_summary_button = tk.Button(
+    workflow_frame,
+    text="📋 Copy Case Summary",
+    command=copy_case_summary,
+    fg="#8A6500",
+    activeforeground="#8A6500",
+    state="disabled",
+    **main_action_button_style,
+)
+copy_summary_button.grid(row=0, column=4, sticky="ew")
 
 ttk.Label(main, textvariable=status_var).grid(row=14, column=0, columnspan=3, sticky="w", pady=(0, 6))
 
@@ -4071,34 +5685,92 @@ date_filter_frame = ttk.Frame(date_outer_frame)
 date_filter_frame.grid(row=0, column=0, columnspan=6, sticky="ew")
 
 current_year = datetime.now().year
-year_values = [str(year) for year in range(current_year - 10, current_year + 2)]
-month_values = [f"{month:02d}" for month in range(1, 13)]
-day_values = [f"{day:02d}" for day in range(1, 32)]
+year_values = [str(year) for year in range(CAPTURE_DATE_MIN.year, current_year + 1)]
 
 ttk.Checkbutton(
     date_filter_frame,
     text="Date after",
     variable=date_after_enabled_var,
-    command=update_capture_options_summary,
+    command=update_date_filter_states,
 ).grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
-ttk.Combobox(date_filter_frame, textvariable=date_after_year_var, values=year_values, width=6).grid(row=0, column=1, padx=2, pady=2)
-ttk.Combobox(date_filter_frame, textvariable=date_after_month_var, values=month_values, width=4).grid(row=0, column=2, padx=2, pady=2)
-ttk.Combobox(date_filter_frame, textvariable=date_after_day_var, values=day_values, width=4).grid(row=0, column=3, padx=2, pady=2)
+
+date_after_year_menu = ttk.Combobox(
+    date_filter_frame,
+    textvariable=date_after_year_var,
+    values=year_values,
+    width=6,
+    state="disabled",
+)
+date_after_year_menu.grid(row=0, column=1, padx=2, pady=2)
+
+date_after_month_menu = ttk.Combobox(
+    date_filter_frame,
+    textvariable=date_after_month_var,
+    values=get_allowed_month_values(datetime.now().year),
+    width=4,
+    state="disabled",
+)
+date_after_month_menu.grid(row=0, column=2, padx=2, pady=2)
+
+date_after_day_menu = ttk.Combobox(
+    date_filter_frame,
+    textvariable=date_after_day_var,
+    values=get_allowed_day_values(datetime.now().year, datetime.now().month),
+    width=4,
+    state="disabled",
+)
+date_after_day_menu.grid(row=0, column=3, padx=2, pady=2)
 
 ttk.Checkbutton(
     date_filter_frame,
     text="Date before",
     variable=date_before_enabled_var,
-    command=update_capture_options_summary,
+    command=update_date_filter_states,
 ).grid(row=1, column=0, sticky="w", padx=(0, 6), pady=2)
-ttk.Combobox(date_filter_frame, textvariable=date_before_year_var, values=year_values, width=6).grid(row=1, column=1, padx=2, pady=2)
-ttk.Combobox(date_filter_frame, textvariable=date_before_month_var, values=month_values, width=4).grid(row=1, column=2, padx=2, pady=2)
-ttk.Combobox(date_filter_frame, textvariable=date_before_day_var, values=day_values, width=4).grid(row=1, column=3, padx=2, pady=2)
+
+date_before_year_menu = ttk.Combobox(
+    date_filter_frame,
+    textvariable=date_before_year_var,
+    values=year_values,
+    width=6,
+    state="disabled",
+)
+date_before_year_menu.grid(row=1, column=1, padx=2, pady=2)
+
+date_before_month_menu = ttk.Combobox(
+    date_filter_frame,
+    textvariable=date_before_month_var,
+    values=get_allowed_month_values(datetime.now().year),
+    width=4,
+    state="disabled",
+)
+date_before_month_menu.grid(row=1, column=2, padx=2, pady=2)
+
+date_before_day_menu = ttk.Combobox(
+    date_filter_frame,
+    textvariable=date_before_day_var,
+    values=get_allowed_day_values(datetime.now().year, datetime.now().month),
+    width=4,
+    state="disabled",
+)
+date_before_day_menu.grid(row=1, column=3, padx=2, pady=2)
+
+for widget, prefix in (
+    (date_after_year_menu, "after"),
+    (date_after_month_menu, "after"),
+    (date_after_day_menu, "after"),
+    (date_before_year_menu, "before"),
+    (date_before_month_menu, "before"),
+    (date_before_day_menu, "before"),
+):
+    widget.bind("<<ComboboxSelected>>", lambda event, p=prefix: on_date_filter_combo_changed(p))
 
 ttk.Label(
     date_filter_frame,
-    text="Year / Month / Day",
-).grid(row=2, column=1, columnspan=3, sticky="w", padx=2, pady=(2, 0))
+    text="Year / Month / Day - allowed range: Jan 01, 2000 through today",
+).grid(row=2, column=1, columnspan=5, sticky="w", padx=2, pady=(2, 0))
+
+update_date_filter_states()
 
 
 artifact_frame = ttk.LabelFrame(capture_options_panel, text="Sidecar Artifacts", padding=8)
@@ -4235,9 +5907,14 @@ ttk.Button(
 
 advanced_options_panel.grid_remove()
 
+case_name_var.trace_add("write", update_case_folder_preview)
+output_root_var.trace_add("write", update_case_folder_preview)
+update_case_folder_preview()
+
 root.protocol("WM_DELETE_WINDOW", on_close)
 
 load_settings(show_popup=False, startup=True)
+apply_app_theme()
 update_window_title()
 if check_vpn_var.get():
     refresh_network_adapters()
