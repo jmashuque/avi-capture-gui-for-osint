@@ -8,11 +8,15 @@ import json
 import math
 import os
 import queue
+import random
 import re
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
+import textwrap
+import time
 import urllib.request
 from urllib.parse import quote, urlsplit, urlunsplit
 from pathlib import Path
@@ -35,12 +39,13 @@ APP_WINDOW_MIN_HEIGHT_WITH_VPN = 900
 URL_ROW_MIN_HEIGHT = 215
 
 APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/ytdlp-gui-for-osint/releases/latest"
-SETTINGS_SCHEMA_VERSION = 18
+SETTINGS_SCHEMA_VERSION = 21
 CAPTURE_DATE_MIN = datetime(2000, 1, 1)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(ROOT, "gui-settings.json")
 JOBS_FILE = os.path.join(ROOT, "gui-jobs.json")
+URL_BOX_PERSISTENCE_FILE = os.path.join(ROOT, "gui-url-box.txt")
 JOBS_FILE_VERSION = 2
 DEFAULT_PROFILE_NAME = "Default"
 
@@ -50,7 +55,7 @@ DEFAULTS = {
     "input_file": os.path.join(ROOT, "urls.txt"),
     "case_name": "Case-%datetime%",
     "cookies_file": os.path.join(ROOT, "cookies.txt"),
-    "use_cookies_file": True,
+    "use_cookies_file": False,
     "output_root": os.path.join(ROOT, "Investigations"),
     "ffmpeg_folder": ROOT,
     "impersonate_target": "None",
@@ -58,6 +63,15 @@ DEFAULTS = {
     "format_strategy": "best",
     "capture_mode": "media",
     "source_scope": "single",
+    "playlist_items_enabled": False,
+    "playlist_items": "",
+    "playlist_order_enabled": False,
+    "playlist_order": "normal",
+    "max_playlist_items_enabled": False,
+    "max_playlist_items": "",
+    "break_on_existing": False,
+    "skip_playlist_after_errors_enabled": False,
+    "skip_playlist_after_errors": "",
     "archive_mode": "use",
     "max_resolution": "best",
     "gui_cache_mode": "after_run",
@@ -94,6 +108,11 @@ DEFAULTS = {
     "write_subs": False,
     "write_auto_subs": False,
     "write_comments": False,
+    "embed_metadata": False,
+    "embed_thumbnail": False,
+    "embed_subs": False,
+    "embed_chapters": False,
+    "embed_info_json": False,
     "vpn_adapter_name": "",
     "split_queue_mode": "per_group",
     "split_queue_urls_per_group": "10",
@@ -111,6 +130,15 @@ DOMAIN_PRESET_SETTING_KEYS = [
     "format_strategy",
     "capture_mode",
     "source_scope",
+    "playlist_items_enabled",
+    "playlist_items",
+    "playlist_order_enabled",
+    "playlist_order",
+    "max_playlist_items_enabled",
+    "max_playlist_items",
+    "break_on_existing",
+    "skip_playlist_after_errors_enabled",
+    "skip_playlist_after_errors",
     "archive_mode",
     "max_resolution",
     "gui_cache_mode",
@@ -146,19 +174,25 @@ DOMAIN_PRESET_SETTING_KEYS = [
     "write_subs",
     "write_auto_subs",
     "write_comments",
+    "embed_metadata",
+    "embed_thumbnail",
+    "embed_subs",
+    "embed_chapters",
+    "embed_info_json",
 ]
 
 PROXY_PROTOCOL_OPTIONS = ["None", "http", "https", "socks4", "socks5"]
 
 APP_SETTINGS_DEFAULTS = {
     "delete_cookies_on_exit": False,
-    "check_vpn": True,
+    "check_vpn": False,
     "dark_mode": False,
     "case_browser_filter": "All",
     "case_browser_sort": "Name",
     "case_browser_current_only": False,
     "case_browser_icon_scale": "Medium",
     "job_persistence": True,
+    "url_box_persistence": False,
     "proxy_protocol": "None",
     "proxy_address": "",
     "proxy_port": "",
@@ -203,6 +237,117 @@ case_browser_reload_after_id = None
 case_browser_active_token = None
 case_browser_result_queue = queue.Queue()
 case_browser_result_poller_running = False
+playlist_preview_reload_after_id = None
+playlist_preview_candidate_urls = []
+playlist_preview_source_signature = ""
+playlist_preview_loaded_signature = ""
+playlist_preview_tab_loaded = False
+url_box_autoload_ready = False
+
+FRESH_STARTUP_MESSAGES = []
+
+
+def fresh_arg_requested():
+    return any(str(arg).strip().lower() == "--fresh" for arg in sys.argv[1:])
+
+
+def collect_fresh_output_roots_from_settings():
+    output_roots = {os.path.abspath(os.path.join(ROOT, "Investigations"))}
+
+    if not os.path.isfile(SETTINGS_FILE):
+        return sorted(output_roots)
+
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return sorted(output_roots)
+
+    def add_output_root(value):
+        value = str(value or "").strip()
+        if not value:
+            return
+
+        try:
+            output_roots.add(os.path.abspath(os.path.expandvars(os.path.expanduser(value))))
+        except Exception:
+            pass
+
+    if isinstance(raw, dict):
+        profiles = raw.get("profiles", {})
+        if isinstance(profiles, dict):
+            for profile_settings in profiles.values():
+                if isinstance(profile_settings, dict):
+                    add_output_root(profile_settings.get("output_root"))
+
+        add_output_root(raw.get("output_root"))
+
+    return sorted(output_roots)
+
+
+def run_fresh_startup_cleanup_if_requested():
+    if not fresh_arg_requested():
+        return []
+
+    targets = [
+        SETTINGS_FILE,
+        JOBS_FILE,
+        URL_BOX_PERSISTENCE_FILE,
+    ]
+
+    for output_root in collect_fresh_output_roots_from_settings():
+        targets.append(os.path.join(output_root, "gui-captured-urls.txt"))
+        targets.append(os.path.join(output_root, "gui-failed-urls.txt"))
+
+    seen = set()
+    deleted = []
+    failed = []
+
+    for target in targets:
+        try:
+            normalized = os.path.abspath(target)
+        except Exception:
+            normalized = str(target)
+
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+
+        if not os.path.exists(normalized):
+            continue
+
+        if not os.path.isfile(normalized):
+            failed.append((normalized, "not a regular file"))
+            continue
+
+        try:
+            os.remove(normalized)
+            deleted.append(normalized)
+        except Exception as e:
+            failed.append((normalized, str(e)))
+
+    messages = [
+        "--fresh was passed. Startup cleanup ran before settings/jobs were loaded.",
+        f"Deleted {len(deleted)} file(s).",
+    ]
+
+    if deleted:
+        messages.append("Deleted:")
+        messages.extend(f"- {path}" for path in deleted)
+
+    if failed:
+        messages.append("Failed:")
+        messages.extend(f"- {path}: {error}" for path, error in failed)
+
+    if not deleted and not failed:
+        messages.append("No existing settings/jobs/captured/failed files were found to delete.")
+
+    return messages
+
+
+FRESH_STARTUP_MESSAGES = run_fresh_startup_cleanup_if_requested()
+
+
 CASE_BROWSER_TREE_BATCH_SIZE = 75
 CASE_BROWSER_CARD_BATCH_SIZE = 24
 
@@ -789,7 +934,13 @@ def format_case_tag_list(values, fallback="none"):
     return "-".join(cleaned) if cleaned else fallback
 
 
-def get_case_template_values(now=None, domains=None, presets=None):
+def format_case_playlist_tag(value):
+    item = safe_case_name(str(value or "").strip())
+    item = re.sub(r"_+", "_", item).strip("_")
+    return item or "playlist"
+
+
+def get_case_template_values(now=None, domains=None, presets=None, playlist=None):
     now = now or datetime.now()
     utc_now = now.astimezone(timezone.utc) if getattr(now, "tzinfo", None) else datetime.now(timezone.utc)
 
@@ -800,6 +951,7 @@ def get_case_template_values(now=None, domains=None, presets=None):
         "%utcdatetime%": utc_now.strftime("%Y%m%d_%H%M%SZ"),
         "%domains%": format_case_tag_list(domains, "domains"),
         "%presets%": format_case_tag_list(presets, "presets"),
+        "%playlist%": format_case_playlist_tag(playlist),
         "%year%": now.strftime("%Y"),
         "%month%": now.strftime("%m"),
         "%day%": now.strftime("%d"),
@@ -809,18 +961,18 @@ def get_case_template_values(now=None, domains=None, presets=None):
     }
 
 
-def render_case_name_template(template, now=None, domains=None, presets=None):
+def render_case_name_template(template, now=None, domains=None, presets=None, playlist=None):
     rendered = str(template or "").strip()
 
-    for tag, value in get_case_template_values(now, domains=domains, presets=presets).items():
+    for tag, value in get_case_template_values(now, domains=domains, presets=presets, playlist=playlist).items():
         rendered = rendered.replace(tag, value)
 
     return rendered
 
 
-def get_resolved_case_name(now=None, domains=None, presets=None):
+def get_resolved_case_name(now=None, domains=None, presets=None, playlist=None):
     template = case_name_var.get().strip()
-    rendered = render_case_name_template(template, now=now, domains=domains, presets=presets)
+    rendered = render_case_name_template(template, now=now, domains=domains, presets=presets, playlist=playlist)
     return safe_case_name(rendered)
 
 
@@ -831,6 +983,15 @@ def insert_case_name_tag(tag):
     except Exception:
         current = case_name_var.get()
         case_name_var.set(f"{current}{tag}")
+
+
+def append_playlist_tag_to_case_template(template):
+    template = str(template or "").strip()
+
+    if "%playlist%" in template.lower():
+        return template
+
+    return f"{template}-%playlist%" if template else "%playlist%"
 
 
 def get_current_case_folder(now=None, domains=None, presets=None):
@@ -1416,6 +1577,120 @@ def append_urls_from_input_file():
         append_log(f"\nLoaded URLs from input file(s) using mixed encoding fallbacks and appended them to the URL box:\n{path}\n")
     else:
         append_log(f"\nLoaded URLs from input file(s) and appended them to the URL box:\n{path}\n")
+
+
+def url_box_text_is_empty():
+    try:
+        return not normalize_url_box_text_block(urls_text.get("1.0", "end"))
+    except Exception:
+        return True
+
+
+def set_url_box_text_silent(content):
+    content = normalize_url_box_text_block(content)
+    urls_text.delete("1.0", "end")
+    if content:
+        urls_text.insert("1.0", content)
+
+    try:
+        urls_text.edit_modified(False)
+    except Exception:
+        pass
+
+
+def read_valid_input_files_for_url_box_silent():
+    paths = get_existing_input_file_paths()
+
+    if not paths:
+        return "", ""
+
+    contents = []
+    readable_paths = []
+
+    for path in paths:
+        content = normalize_url_box_text_block(read_text_file_best_effort(path, log_errors=False))
+        if not content:
+            continue
+
+        contents.append(content)
+        readable_paths.append(path)
+
+    combined = normalize_url_box_text_block("\n".join(contents))
+
+    if not combined or not extract_urls_from_text(combined):
+        return "", describe_input_file_paths(readable_paths or paths)
+
+    return combined, describe_input_file_paths(readable_paths)
+
+
+def load_url_box_persistence_if_enabled():
+    if not url_box_persistence_var.get():
+        return False
+
+    if not os.path.isfile(URL_BOX_PERSISTENCE_FILE):
+        return False
+
+    try:
+        content = Path(URL_BOX_PERSISTENCE_FILE).read_text(encoding="utf-8-sig")
+        set_url_box_text_silent(content)
+        return True
+    except Exception as e:
+        try:
+            append_log(f"\nWARNING: Could not load URL Box Persistence file:\n{URL_BOX_PERSISTENCE_FILE}\n{e}\n")
+        except Exception:
+            pass
+        return False
+
+
+def save_url_box_persistence_if_enabled():
+    if not url_box_persistence_var.get():
+        return
+
+    try:
+        content = urls_text.get("1.0", "end-1c").replace("\r\n", "\n").replace("\r", "\n")
+        Path(URL_BOX_PERSISTENCE_FILE).write_text(content, encoding="utf-8")
+    except Exception as e:
+        try:
+            append_log(f"\nWARNING: Could not save URL Box Persistence file:\n{URL_BOX_PERSISTENCE_FILE}\n{e}\n")
+        except Exception:
+            pass
+
+
+def auto_populate_url_box_from_input_files_if_empty():
+    if not url_box_text_is_empty():
+        return False
+
+    content, _path_label = read_valid_input_files_for_url_box_silent()
+
+    if not content:
+        return False
+
+    set_url_box_text_silent(content)
+    try:
+        schedule_playlist_preview_autoload()
+    except Exception:
+        pass
+    return True
+
+
+def initialize_url_box_from_persistence_and_input_files():
+    global url_box_autoload_ready
+
+    load_url_box_persistence_if_enabled()
+    auto_populate_url_box_from_input_files_if_empty()
+    url_box_autoload_ready = True
+
+
+def handle_input_file_var_changed(*args):
+    try:
+        schedule_playlist_preview_autoload()
+    except Exception:
+        pass
+
+    if not url_box_autoload_ready:
+        return
+
+    auto_populate_url_box_from_input_files_if_empty()
 
 
 def save_urls_to_input_file():
@@ -2420,14 +2695,46 @@ def build_powershell_command():
             "low_bandwidth": "LowBandwidth",
         }.get(format_strategy, "Best")]
 
-    media_only = capture_mode_var.get() == "media_only"
+    capture_mode = normalize_capture_mode(capture_mode_var.get())
+    media_only = capture_mode == "media_only"
+    sidecars_enabled = capture_mode in {"media", "metadata_only"}
+    embed_enabled = capture_mode in {"media", "media_embedded"}
+
     if media_only:
         cmd += ["-MediaOnly"]
-    elif capture_mode_var.get() == "metadata_only":
+    elif capture_mode == "metadata_only":
         cmd += ["-MetadataOnly"]
 
-    if source_scope_var.get() == "include_playlist":
+    include_playlist = source_scope_var.get() == "include_playlist"
+    if include_playlist:
         cmd += ["-IncludePlaylist"]
+
+        if playlist_items_enabled_var.get():
+            raw_playlist_items = playlist_items_var.get().strip()
+            playlist_items = normalize_playlist_items(raw_playlist_items)
+            if not playlist_items:
+                raise ValueError("Playlist items is enabled but invalid. Use indexes or ranges such as 1:10,30,35:40.")
+            cmd += ["-PlaylistItems", playlist_items]
+
+        if playlist_order_enabled_var.get():
+            playlist_order = normalize_playlist_order(playlist_order_var.get())
+            if playlist_order != "normal":
+                cmd += ["-PlaylistOrder", script_playlist_order(playlist_order)]
+
+        if max_playlist_items_enabled_var.get():
+            max_playlist_items = normalize_optional_positive_int_string(max_playlist_items_var.get())
+            if not max_playlist_items:
+                raise ValueError("Max playlist items is enabled but blank or invalid.")
+            cmd += ["-MaxPlaylistItems", max_playlist_items]
+
+        if break_on_existing_var.get():
+            cmd += ["-BreakOnExisting"]
+
+        if skip_playlist_after_errors_enabled_var.get():
+            skip_errors = normalize_optional_positive_int_string(skip_playlist_after_errors_var.get())
+            if not skip_errors:
+                raise ValueError("Skip after failed items is enabled but blank or invalid.")
+            cmd += ["-SkipPlaylistAfterErrors", skip_errors]
 
     archive_mode = archive_mode_var.get().strip() or "use"
     if archive_mode == "ignore":
@@ -2444,10 +2751,10 @@ def build_powershell_command():
     cmd += ["-GuiCacheMode", script_gui_cache_mode(gui_cache_mode_var.get())]
     cmd += ["-ManifestMode", script_manifest_mode(manifest_mode_var.get())]
 
-    if save_playlist_metadata_var.get() and not media_only:
+    if save_playlist_metadata_var.get() and sidecars_enabled:
         cmd += ["-SavePlaylistMetadata"]
 
-    if generate_url_shortcuts_var.get() and not media_only:
+    if generate_url_shortcuts_var.get() and sidecars_enabled:
         cmd += ["-GenerateUrlShortcuts"]
 
     match_keywords = match_keywords_var.get().strip()
@@ -2510,7 +2817,7 @@ def build_powershell_command():
     if keep_partials_var.get():
         cmd += ["-KeepPartials"]
 
-    if not media_only:
+    if sidecars_enabled:
         if write_info_json_var.get():
             cmd += ["-WriteInfoJson"]
 
@@ -2531,6 +2838,22 @@ def build_powershell_command():
 
         if write_comments_var.get():
             cmd += ["-WriteComments"]
+
+    if embed_enabled:
+        if embed_metadata_var.get():
+            cmd += ["-EmbedMetadata"]
+
+        if embed_thumbnail_var.get():
+            cmd += ["-EmbedThumbnail"]
+
+        if embed_subs_var.get():
+            cmd += ["-EmbedSubs"]
+
+        if embed_chapters_var.get():
+            cmd += ["-EmbedChapters"]
+
+        if embed_info_json_var.get():
+            cmd += ["-EmbedInfoJson"]
 
     return cmd
 
@@ -2710,14 +3033,46 @@ def build_powershell_command_for_job(job):
             "low_bandwidth": "LowBandwidth",
         }.get(format_strategy, "Best")]
 
-    media_only = settings.get("capture_mode", DEFAULTS["capture_mode"]) == "media_only"
+    capture_mode = normalize_capture_mode(settings.get("capture_mode", DEFAULTS["capture_mode"]))
+    media_only = capture_mode == "media_only"
+    sidecars_enabled = capture_mode in {"media", "metadata_only"}
+    embed_enabled = capture_mode in {"media", "media_embedded"}
+
     if media_only:
         cmd += ["-MediaOnly"]
-    elif settings.get("capture_mode", DEFAULTS["capture_mode"]) == "metadata_only":
+    elif capture_mode == "metadata_only":
         cmd += ["-MetadataOnly"]
 
-    if settings.get("source_scope", DEFAULTS["source_scope"]) == "include_playlist":
+    include_playlist = settings.get("source_scope", DEFAULTS["source_scope"]) == "include_playlist"
+    if include_playlist:
         cmd += ["-IncludePlaylist"]
+
+        if bool(settings.get("playlist_items_enabled", DEFAULTS["playlist_items_enabled"])):
+            raw_playlist_items = str(settings.get("playlist_items", DEFAULTS["playlist_items"]) or "").strip()
+            playlist_items = normalize_playlist_items(raw_playlist_items)
+            if not playlist_items:
+                raise ValueError("Playlist items is enabled but invalid. Use indexes or ranges such as 1:10,30,35:40.")
+            cmd += ["-PlaylistItems", playlist_items]
+
+        if bool(settings.get("playlist_order_enabled", DEFAULTS["playlist_order_enabled"])):
+            playlist_order = normalize_playlist_order(settings.get("playlist_order", DEFAULTS["playlist_order"]))
+            if playlist_order != "normal":
+                cmd += ["-PlaylistOrder", script_playlist_order(playlist_order)]
+
+        if bool(settings.get("max_playlist_items_enabled", DEFAULTS["max_playlist_items_enabled"])):
+            max_playlist_items = normalize_optional_positive_int_string(settings.get("max_playlist_items", DEFAULTS["max_playlist_items"]))
+            if not max_playlist_items:
+                raise ValueError("Max playlist items is enabled but blank or invalid.")
+            cmd += ["-MaxPlaylistItems", max_playlist_items]
+
+        if bool(settings.get("break_on_existing", DEFAULTS["break_on_existing"])):
+            cmd += ["-BreakOnExisting"]
+
+        if bool(settings.get("skip_playlist_after_errors_enabled", DEFAULTS["skip_playlist_after_errors_enabled"])):
+            skip_errors = normalize_optional_positive_int_string(settings.get("skip_playlist_after_errors", DEFAULTS["skip_playlist_after_errors"]))
+            if not skip_errors:
+                raise ValueError("Skip after failed items is enabled but blank or invalid.")
+            cmd += ["-SkipPlaylistAfterErrors", skip_errors]
 
     archive_mode = str(settings.get("archive_mode", DEFAULTS["archive_mode"]) or "use").strip()
     if archive_mode == "ignore":
@@ -2734,10 +3089,10 @@ def build_powershell_command_for_job(job):
     cmd += ["-GuiCacheMode", script_gui_cache_mode(settings.get("gui_cache_mode", DEFAULTS["gui_cache_mode"]))]
     cmd += ["-ManifestMode", script_manifest_mode(settings.get("manifest_mode", DEFAULTS["manifest_mode"]))]
 
-    if bool(settings.get("save_playlist_metadata", DEFAULTS["save_playlist_metadata"])) and not media_only:
+    if bool(settings.get("save_playlist_metadata", DEFAULTS["save_playlist_metadata"])) and sidecars_enabled:
         cmd += ["-SavePlaylistMetadata"]
 
-    if bool(settings.get("generate_url_shortcuts", DEFAULTS["generate_url_shortcuts"])) and not media_only:
+    if bool(settings.get("generate_url_shortcuts", DEFAULTS["generate_url_shortcuts"])) and sidecars_enabled:
         cmd += ["-GenerateUrlShortcuts"]
 
     match_keywords = str(settings.get("match_keywords", "") or "").strip()
@@ -2800,7 +3155,7 @@ def build_powershell_command_for_job(job):
     if bool(settings.get("keep_partials", DEFAULTS["keep_partials"])):
         cmd += ["-KeepPartials"]
 
-    if not media_only:
+    if sidecars_enabled:
         if bool(settings.get("write_info_json", DEFAULTS["write_info_json"])):
             cmd += ["-WriteInfoJson"]
 
@@ -2821,6 +3176,22 @@ def build_powershell_command_for_job(job):
 
         if bool(settings.get("write_comments", DEFAULTS["write_comments"])):
             cmd += ["-WriteComments"]
+
+    if embed_enabled:
+        if bool(settings.get("embed_metadata", DEFAULTS["embed_metadata"])):
+            cmd += ["-EmbedMetadata"]
+
+        if bool(settings.get("embed_thumbnail", DEFAULTS["embed_thumbnail"])):
+            cmd += ["-EmbedThumbnail"]
+
+        if bool(settings.get("embed_subs", DEFAULTS["embed_subs"])):
+            cmd += ["-EmbedSubs"]
+
+        if bool(settings.get("embed_chapters", DEFAULTS["embed_chapters"])):
+            cmd += ["-EmbedChapters"]
+
+        if bool(settings.get("embed_info_json", DEFAULTS["embed_info_json"])):
+            cmd += ["-EmbedInfoJson"]
 
     return cmd
 
@@ -2970,6 +3341,13 @@ def run_preflight_check():
     preflight_done_var.set(passed is True)
 
 
+def normalize_capture_mode(value):
+    value = str(value or "").strip().lower()
+    if value in {"media", "media_embedded", "media_only", "metadata_only"}:
+        return value
+    return DEFAULTS["capture_mode"]
+
+
 def get_settings_dict():
     return {
         "script_path": script_path_var.get(),
@@ -2985,6 +3363,15 @@ def get_settings_dict():
         "format_strategy": format_strategy_var.get(),
         "capture_mode": capture_mode_var.get(),
         "source_scope": source_scope_var.get(),
+        "playlist_items_enabled": playlist_items_enabled_var.get(),
+        "playlist_items": normalize_playlist_items(playlist_items_var.get()),
+        "playlist_order_enabled": playlist_order_enabled_var.get(),
+        "playlist_order": normalize_playlist_order(playlist_order_var.get()),
+        "max_playlist_items_enabled": max_playlist_items_enabled_var.get(),
+        "max_playlist_items": normalize_optional_positive_int_string(max_playlist_items_var.get()),
+        "break_on_existing": break_on_existing_var.get(),
+        "skip_playlist_after_errors_enabled": skip_playlist_after_errors_enabled_var.get(),
+        "skip_playlist_after_errors": normalize_optional_positive_int_string(skip_playlist_after_errors_var.get()),
         "archive_mode": archive_mode_var.get(),
         "max_resolution": max_resolution_var.get(),
         "gui_cache_mode": normalize_gui_cache_mode(gui_cache_mode_var.get()),
@@ -3021,6 +3408,11 @@ def get_settings_dict():
         "write_subs": write_subs_var.get(),
         "write_auto_subs": write_auto_subs_var.get(),
         "write_comments": write_comments_var.get(),
+        "embed_metadata": embed_metadata_var.get(),
+        "embed_thumbnail": embed_thumbnail_var.get(),
+        "embed_subs": embed_subs_var.get(),
+        "embed_chapters": embed_chapters_var.get(),
+        "embed_info_json": embed_info_json_var.get(),
         "vpn_adapter_name": vpn_adapter_var.get(),
         "split_queue_mode": split_queue_mode_var.get(),
         "split_queue_urls_per_group": normalize_positive_int_string(
@@ -3052,8 +3444,17 @@ def apply_settings_dict(settings):
         format_strategy_var.set("prefer_mp4")
     else:
         format_strategy_var.set(DEFAULTS["format_strategy"])
-    capture_mode_var.set(settings.get("capture_mode", DEFAULTS["capture_mode"]))
+    capture_mode_var.set(normalize_capture_mode(settings.get("capture_mode", DEFAULTS["capture_mode"])))
     source_scope_var.set(settings.get("source_scope", DEFAULTS["source_scope"]))
+    playlist_items_enabled_var.set(bool(settings.get("playlist_items_enabled", DEFAULTS["playlist_items_enabled"])))
+    playlist_items_var.set(normalize_playlist_items(settings.get("playlist_items", DEFAULTS["playlist_items"])))
+    playlist_order_enabled_var.set(bool(settings.get("playlist_order_enabled", DEFAULTS["playlist_order_enabled"])))
+    playlist_order_var.set(normalize_playlist_order(settings.get("playlist_order", DEFAULTS["playlist_order"])))
+    max_playlist_items_enabled_var.set(bool(settings.get("max_playlist_items_enabled", DEFAULTS["max_playlist_items_enabled"])))
+    max_playlist_items_var.set(normalize_optional_positive_int_string(settings.get("max_playlist_items", DEFAULTS["max_playlist_items"])))
+    break_on_existing_var.set(bool(settings.get("break_on_existing", DEFAULTS["break_on_existing"])))
+    skip_playlist_after_errors_enabled_var.set(bool(settings.get("skip_playlist_after_errors_enabled", DEFAULTS["skip_playlist_after_errors_enabled"])))
+    skip_playlist_after_errors_var.set(normalize_optional_positive_int_string(settings.get("skip_playlist_after_errors", DEFAULTS["skip_playlist_after_errors"])))
     archive_mode_var.set(settings.get("archive_mode", DEFAULTS["archive_mode"]))
     max_resolution_var.set(settings.get("max_resolution", DEFAULTS["max_resolution"]))
     gui_cache_mode_var.set(display_gui_cache_mode(settings.get("gui_cache_mode", DEFAULTS["gui_cache_mode"])))
@@ -3119,6 +3520,11 @@ def apply_settings_dict(settings):
     write_subs_var.set(bool(settings.get("write_subs", DEFAULTS["write_subs"])))
     write_auto_subs_var.set(bool(settings.get("write_auto_subs", DEFAULTS["write_auto_subs"])))
     write_comments_var.set(bool(settings.get("write_comments", DEFAULTS["write_comments"])))
+    embed_metadata_var.set(bool(settings.get("embed_metadata", DEFAULTS["embed_metadata"])))
+    embed_thumbnail_var.set(bool(settings.get("embed_thumbnail", DEFAULTS["embed_thumbnail"])))
+    embed_subs_var.set(bool(settings.get("embed_subs", DEFAULTS["embed_subs"])))
+    embed_chapters_var.set(bool(settings.get("embed_chapters", DEFAULTS["embed_chapters"])))
+    embed_info_json_var.set(bool(settings.get("embed_info_json", DEFAULTS["embed_info_json"])))
     vpn_adapter_var.set(settings.get("vpn_adapter_name", DEFAULTS["vpn_adapter_name"]))
     split_queue_mode_var.set(normalize_split_queue_mode(settings.get("split_queue_mode", DEFAULTS["split_queue_mode"])))
     split_queue_urls_per_group_var.set(normalize_positive_int_string(
@@ -3257,7 +3663,7 @@ def format_command_for_log(cmd):
             skip_next_proxy = False
             continue
 
-        if part == "-ProxyUrl" and index + 1 < len(cmd):
+        if part in {"-ProxyUrl", "--proxy"} and index + 1 < len(cmd):
             safe_parts.append(part)
             safe_parts.append(mask_proxy_url(cmd[index + 1]))
             skip_next_proxy = True
@@ -3295,6 +3701,7 @@ def get_app_settings_dict():
         "case_browser_current_only": case_browser_current_only_var.get(),
         "case_browser_icon_scale": case_browser_icon_scale_var.get(),
         "job_persistence": job_persistence_var.get(),
+        "url_box_persistence": url_box_persistence_var.get(),
     }
     settings.update(get_proxy_settings_dict(include_sensitive=False))
     return settings
@@ -3331,6 +3738,13 @@ def apply_app_settings_dict(settings):
     except Exception:
         pass
 
+    try:
+        url_box_persistence_var.set(
+            bool(settings.get("url_box_persistence", APP_SETTINGS_DEFAULTS["url_box_persistence"]))
+        )
+    except Exception:
+        pass
+
     proxy_no_save = bool(settings.get("proxy_no_save", APP_SETTINGS_DEFAULTS["proxy_no_save"]))
     proxy_no_save_var.set(proxy_no_save)
 
@@ -3354,10 +3768,12 @@ def get_app_settings_summary_lines():
     delete_state = "enabled" if delete_cookies_on_exit_var.get() else "disabled"
     vpn_state = "enabled" if check_vpn_var.get() else "disabled"
     persistence_state = "enabled" if job_persistence_var.get() else "disabled"
+    url_box_state = "enabled" if url_box_persistence_var.get() else "disabled"
     return [
         f"Delete cookies on exit: {delete_state}",
         f"Check VPN: {vpn_state}",
         f"Job persistence: {persistence_state}",
+        f"URL box persistence: {url_box_state}",
         f"Proxy: {get_proxy_status_summary()}",
     ]
 
@@ -4741,24 +5157,19 @@ def toggle_use_cookies_file_setting():
 
 
 def adjust_window_for_vpn_visibility():
+    """Keep the top-level window size stable when VPN checking is toggled.
+
+    The VPN panel is shown/hidden inside the existing Capture tab space. The
+    Output Log row owns the extra vertical slack, so it expands when the VPN
+    panel is hidden and retracts when the VPN panel is visible.
+    """
     try:
-        vpn_enabled = check_vpn_var.get()
-        target_min_height = APP_WINDOW_MIN_HEIGHT_WITH_VPN if vpn_enabled else APP_WINDOW_MIN_HEIGHT_BASE
-        target_height = APP_WINDOW_HEIGHT_WITH_VPN if vpn_enabled else APP_WINDOW_HEIGHT_BASE
-
-        root.minsize(APP_WINDOW_MIN_WIDTH, target_min_height)
+        root.minsize(APP_WINDOW_MIN_WIDTH, APP_WINDOW_MIN_HEIGHT_WITH_VPN)
+        main.rowconfigure(10, weight=0, minsize=URL_ROW_MIN_HEIGHT)
+        main.rowconfigure(15, weight=1)
         root.update_idletasks()
-
-        current_width = max(root.winfo_width(), APP_WINDOW_WIDTH)
-        current_height = root.winfo_height()
-
-        if vpn_enabled and current_height < target_height:
-            root.geometry(f"{current_width}x{target_height}")
-        elif not vpn_enabled and current_height <= APP_WINDOW_HEIGHT_WITH_VPN + 20:
-            root.geometry(f"{current_width}x{APP_WINDOW_HEIGHT_BASE}")
     except Exception:
         pass
-
 
 def update_vpn_section_visibility():
     try:
@@ -4787,6 +5198,14 @@ def toggle_job_persistence_setting():
     if saved and job_persistence_var.get():
         save_job_queue_state()
         append_log(f"Job queue state saved to: {JOBS_FILE}\n")
+
+
+def toggle_url_box_persistence_setting():
+    state = "enabled" if url_box_persistence_var.get() else "disabled"
+    saved = save_app_settings(show_popup=False, changed_setting_label=f"URL Box Persistence {state}")
+    if saved and url_box_persistence_var.get():
+        save_url_box_persistence_if_enabled()
+        append_log(f"URL box contents saved to: {URL_BOX_PERSISTENCE_FILE}\n")
 
 
 def delete_selected_cookies_file_on_exit():
@@ -5774,6 +6193,7 @@ def serialize_queue_job(job):
         "completed_urls",
         "summary",
         "applied_domain_presets",
+        "playlist_name",
         "domains",
         "allow_domain_collision",
         "checked",
@@ -5843,6 +6263,7 @@ def normalize_loaded_queue_job(raw_job):
         "completed_urls": completed_urls,
         "summary": str(raw_job.get("summary", "") or ""),
         "applied_domain_presets": list(raw_job.get("applied_domain_presets", []) or []),
+        "playlist_name": str(raw_job.get("playlist_name", "") or ""),
         "domains": list(raw_job.get("domains", []) or []),
         "allow_domain_collision": bool(raw_job.get("allow_domain_collision", False)),
         "checked": bool(raw_job.get("checked", False)),
@@ -6188,7 +6609,7 @@ def update_job_queue_progress():
             pass
 
 
-def add_urls_to_queue_as_job(urls, resolved_case_name=None, settings=None, case_template=None):
+def add_urls_to_queue_as_job(urls, resolved_case_name=None, settings=None, case_template=None, playlist_name=None):
     try:
         clean_urls = []
         seen = set()
@@ -6214,6 +6635,7 @@ def add_urls_to_queue_as_job(urls, resolved_case_name=None, settings=None, case_
             now=datetime.now(),
             domains=job_domains_for_tags,
             presets=applied_presets,
+            playlist=playlist_name,
         ))
 
         if not resolved_case_name:
@@ -6235,6 +6657,7 @@ def add_urls_to_queue_as_job(urls, resolved_case_name=None, settings=None, case_
             "completed_urls": 0,
             "summary": "",
             "applied_domain_presets": applied_presets,
+            "playlist_name": str(playlist_name or ""),
             "checked": False,
         }
         job["domains"] = get_job_domain_keys(job)
@@ -8511,6 +8934,1628 @@ def update_ytdlp_direct(update_target):
 
 
 
+
+def update_deno_direct():
+    deno_path = resolve_deno_executable_for_gui()
+    deno_from_path = shutil.which("deno.exe") or shutil.which("deno")
+    deno_resolved = deno_path
+
+    if deno_path == "deno" and deno_from_path:
+        deno_resolved = deno_from_path
+
+    if not deno_resolved or (deno_resolved == "deno" and not deno_from_path):
+        messagebox.showerror(
+            "Deno not found",
+            "Deno was not found beside the app or in PATH. Place deno.exe beside the app, beside yt-dlp when required, or make it available in PATH.",
+        )
+        return
+
+    confirm = messagebox.askyesno(
+        "Update Deno?",
+        "This will run Deno's built-in updater:\n\n"
+        f"{deno_resolved} upgrade\n\n"
+        "The latest Deno version may be incompatible with the current yt-dlp workflow or may be blocked by ASR/endpoint protection because it changes a local executable.\n\n"
+        "Continue?",
+    )
+
+    if not confirm:
+        return
+
+    append_log(
+        "\nStarting Deno update...\n"
+        f"Deno path: {deno_resolved}\n"
+        "Command source: GUI direct subprocess, not the PowerShell capture script.\n\n"
+    )
+    set_status("Updating Deno...")
+
+    def worker():
+        try:
+            cwd = os.path.dirname(os.path.abspath(deno_resolved)) if os.path.isfile(deno_resolved) else ROOT
+            result = subprocess.Popen(
+                [deno_resolved, "upgrade"],
+                cwd=cwd or ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+            )
+
+            if result.stdout:
+                for line in result.stdout:
+                    root.after(0, append_log, line)
+
+            exit_code = result.wait()
+
+            if exit_code == 0:
+                root.after(0, append_log, f"\nDeno update completed successfully. Exit code: {exit_code}\n")
+                root.after(0, set_status, "Deno update complete")
+                root.after(0, messagebox.showinfo, "Deno updated", "Deno update completed successfully.")
+            else:
+                root.after(0, append_log, f"\nDeno update failed. Exit code: {exit_code}\n")
+                root.after(0, set_status, f"Deno update failed with exit code {exit_code}")
+                root.after(
+                    0,
+                    messagebox.showwarning,
+                    "Deno update failed",
+                    f"Deno exited with code {exit_code}. Review the output log. "
+                    "The update may have been blocked by ASR or endpoint protection.",
+                )
+
+        except Exception as e:
+            root.after(0, set_status, "Deno update error")
+            root.after(0, append_log, f"\nDeno update error: {e}\n")
+            root.after(0, messagebox.showerror, "Deno update error", str(e))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+
+def extract_json_object_from_stdout(stdout_text):
+    stdout_text = str(stdout_text or "").strip()
+
+    if not stdout_text:
+        raise ValueError("yt-dlp returned no JSON output.")
+
+    try:
+        return json.loads(stdout_text)
+    except Exception:
+        pass
+
+    first = stdout_text.find("{")
+    last = stdout_text.rfind("}")
+
+    if first >= 0 and last > first:
+        return json.loads(stdout_text[first:last + 1])
+
+    raise ValueError("yt-dlp output did not contain a JSON object.")
+
+
+def format_preview_duration(value):
+    try:
+        seconds = int(float(value))
+    except Exception:
+        return ""
+
+    if seconds < 0:
+        return ""
+
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+
+    return f"{minutes}:{seconds:02d}"
+
+
+def get_playlist_entry_url(entry, playlist_info=None):
+    entry = entry if isinstance(entry, dict) else {}
+    playlist_info = playlist_info if isinstance(playlist_info, dict) else {}
+
+    for key in ("webpage_url", "original_url", "url"):
+        value = str(entry.get(key) or "").strip()
+        if value.startswith(("http://", "https://")):
+            return value
+
+    entry_id = str(entry.get("id") or "").strip()
+    extractor_key = str(entry.get("extractor_key") or playlist_info.get("extractor_key") or "").lower()
+    extractor = str(entry.get("extractor") or playlist_info.get("extractor") or "").lower()
+
+    if entry_id and ("youtube" in extractor_key or "youtube" in extractor):
+        return f"https://www.youtube.com/watch?v={entry_id}"
+
+    return str(entry.get("url") or "").strip()
+
+
+def collapse_playlist_indexes(values):
+    clean = sorted({
+        int(value)
+        for value in values
+        if str(value).strip().lstrip("-").isdigit() and int(value) > 0
+    })
+
+    if not clean:
+        return ""
+
+    ranges = []
+    start = previous = clean[0]
+
+    for value in clean[1:]:
+        if value == previous + 1:
+            previous = value
+            continue
+
+        ranges.append(f"{start}:{previous}" if start != previous else str(start))
+        start = previous = value
+
+    ranges.append(f"{start}:{previous}" if start != previous else str(start))
+    return ",".join(ranges)
+
+
+def get_preview_candidate_urls():
+    source_text = get_current_url_source_text()
+
+    if not source_text.strip():
+        return []
+
+    analysis = analyze_url_source_text(source_text)
+    seen = set()
+    urls = []
+
+    for url in analysis.get("valid_urls", []):
+        normalized = normalize_url_for_compare(url)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        urls.append(url)
+
+    return urls
+
+
+def refresh_playlist_preview_candidate_cache():
+    global playlist_preview_candidate_urls, playlist_preview_source_signature
+
+    try:
+        urls = get_preview_candidate_urls()
+    except Exception:
+        urls = []
+
+    signature = "\n".join(urls)
+    changed = signature != playlist_preview_source_signature
+
+    playlist_preview_candidate_urls = urls
+    playlist_preview_source_signature = signature
+
+    return changed
+
+
+def show_playlist_preview_placeholder(message=None):
+    global playlist_preview_tab_loaded, playlist_preview_loaded_signature
+
+    try:
+        tab = playlist_preview_tab
+    except NameError:
+        return
+
+    for child in tab.winfo_children():
+        try:
+            child.destroy()
+        except Exception:
+            pass
+
+    tab.columnconfigure(0, weight=1)
+    tab.rowconfigure(0, weight=1)
+
+    frame = ttk.Frame(tab, padding=16)
+    frame.grid(row=0, column=0, sticky="nsew")
+    frame.columnconfigure(0, weight=1)
+    frame.rowconfigure(0, weight=1)
+
+    content = ttk.Frame(frame)
+    content.grid(row=0, column=0)
+
+    ttk.Label(
+        content,
+        text=message or "Playlist Preview is waiting for URL box or Input File URLs.",
+        anchor="center",
+        justify="center",
+    ).pack(pady=(0, 8))
+
+    ttk.Button(
+        content,
+        text="Refresh Playlist Preview",
+        command=lambda: open_playlist_preview_dialog(silent=False, force_reload=True),
+    ).pack()
+
+    playlist_preview_tab_loaded = False
+    playlist_preview_loaded_signature = ""
+
+
+def playlist_preview_tab_is_selected():
+    try:
+        return app_notebook.select() == str(playlist_preview_tab)
+    except Exception:
+        return False
+
+
+def schedule_playlist_preview_autoload(delay_ms=400):
+    global playlist_preview_reload_after_id
+
+    try:
+        if playlist_preview_reload_after_id:
+            root.after_cancel(playlist_preview_reload_after_id)
+    except Exception:
+        pass
+
+    def do_refresh():
+        global playlist_preview_reload_after_id, playlist_preview_tab_loaded
+        playlist_preview_reload_after_id = None
+
+        changed = refresh_playlist_preview_candidate_cache()
+
+        if changed:
+            playlist_preview_tab_loaded = False
+
+        if playlist_preview_tab_is_selected():
+            try:
+                open_playlist_preview_dialog(silent=True, force_reload=changed)
+            except Exception as e:
+                try:
+                    append_log(f"\nPlaylist Preview auto-load failed: {e}\n")
+                except Exception:
+                    pass
+
+    try:
+        playlist_preview_reload_after_id = root.after(delay_ms, do_refresh)
+    except Exception:
+        playlist_preview_reload_after_id = None
+
+
+def handle_playlist_preview_source_changed(event=None):
+    try:
+        if event is not None and hasattr(event, "widget") and hasattr(event.widget, "edit_modified"):
+            if not event.widget.edit_modified():
+                return
+            event.widget.edit_modified(False)
+    except Exception:
+        pass
+
+    schedule_playlist_preview_autoload()
+
+
+def on_notebook_tab_changed(event=None):
+    if playlist_preview_tab_is_selected():
+        try:
+            open_playlist_preview_dialog(silent=True)
+        except Exception as e:
+            try:
+                append_log(f"\nPlaylist Preview tab load failed: {e}\n")
+            except Exception:
+                pass
+
+
+def build_playlist_preview_command(url):
+    yt_dlp_path = yt_dlp_path_var.get().strip()
+
+    if not yt_dlp_path or not os.path.isfile(yt_dlp_path):
+        raise ValueError("yt-dlp path is missing or invalid.")
+
+    cmd = [
+        yt_dlp_path,
+        "--flat-playlist",
+        "--dump-single-json",
+        "--no-warnings",
+        "--no-progress",
+        "--js-runtimes",
+        f"deno:{resolve_deno_executable_for_gui()}",
+        "--user-agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "--add-header",
+        "Accept-Language: en-US,en;q=0.9",
+    ]
+
+    cookies_file = cookies_file_var.get().strip()
+    if use_cookies_file_var.get() and cookies_file:
+        cmd += ["--cookies", cookies_file]
+
+    proxy_url = get_proxy_url_for_command()
+    if proxy_url:
+        cmd += ["--proxy", proxy_url]
+
+    impersonate_target = normalize_impersonate_target(impersonate_var.get())
+    if impersonate_target:
+        cmd += ["--impersonate", impersonate_target]
+
+    cmd.append(url)
+    return cmd
+
+
+def open_playlist_preview_dialog(silent=False, force_reload=False):
+    global playlist_preview_tab_loaded, playlist_preview_loaded_signature
+
+    changed = refresh_playlist_preview_candidate_cache()
+    urls = list(playlist_preview_candidate_urls)
+
+    if not urls:
+        if silent:
+            show_playlist_preview_placeholder("Playlist Preview is waiting for URL box or Input File URLs.")
+        else:
+            show_playlist_preview_placeholder("No valid URL text or input file contents were found to preview.")
+            try:
+                app_notebook.select(playlist_preview_tab)
+            except Exception:
+                pass
+        return
+
+    try:
+        dialog = playlist_preview_tab
+        app_notebook.select(dialog)
+    except NameError:
+        if not silent:
+            messagebox.showerror("Playlist Preview unavailable", "Playlist Preview tab is not available.")
+        return
+
+    if playlist_preview_tab_loaded and not force_reload and not changed and playlist_preview_loaded_signature == playlist_preview_source_signature:
+        return
+
+    for child in dialog.winfo_children():
+        try:
+            child.destroy()
+        except Exception:
+            pass
+
+    dialog.columnconfigure(0, weight=1)
+    for row_index in range(0, 12):
+        try:
+            dialog.rowconfigure(row_index, weight=0)
+        except Exception:
+            pass
+    dialog.rowconfigure(2, weight=1)
+    dialog.rowconfigure(4, weight=1)
+    dialog.rowconfigure(7, weight=1)
+
+    stop_event = threading.Event()
+    playlists = []
+    playlist_by_iid = {}
+    url_records = [
+        {"iid": f"url-{index}", "number": index, "checked": True, "status": "Ready", "url": url}
+        for index, url in enumerate(urls, start=1)
+    ]
+    url_by_iid = {record["iid"]: record for record in url_records}
+    scan_running = {"value": False}
+
+    status_var = tk.StringVar(value=f"Loaded {len(urls)} URL(s). Choose URLs, then press Start Checked or Start Selected.")
+    selected_playlist_var = tk.StringVar(value="No playlist selected.")
+    pacing_var = tk.StringVar(value="0 sec + up to 5 sec jitter")
+
+    preview_pacing_options = {
+        "0 sec + up to 5 sec jitter": (0, 5),
+        "5 sec + up to 10 sec jitter": (5, 10),
+        "15 sec + up to 30 sec jitter": (15, 30),
+    }
+
+    header = ttk.Frame(dialog, padding=(12, 12, 12, 6))
+    header.grid(row=0, column=0, sticky="ew")
+    header.columnconfigure(0, weight=1)
+
+    ttk.Label(header, textvariable=status_var).grid(row=0, column=0, sticky="w")
+
+    pacing_frame = ttk.Frame(header)
+    pacing_frame.grid(row=1, column=0, sticky="w", pady=(4, 0))
+    ttk.Label(pacing_frame, text="Preview pacing").pack(side="left", padx=(0, 6))
+    pacing_menu = ttk.Combobox(
+        pacing_frame,
+        textvariable=pacing_var,
+        values=list(preview_pacing_options.keys()),
+        state="readonly",
+        width=28,
+    )
+    pacing_menu.pack(side="left")
+
+    def set_buttons_scanning(is_scanning):
+        scan_running["value"] = is_scanning
+        try:
+            start_button.configure(state="disabled" if is_scanning else "normal")
+            start_selected_button.configure(state="disabled" if is_scanning else "normal")
+            stop_button.configure(state="normal" if is_scanning else "disabled")
+        except Exception:
+            pass
+
+    def url_checkmark(record):
+        return "☑" if record.get("checked") else "☐"
+
+    def update_url_tree_row(iid):
+        try:
+            record = url_by_iid.get(iid)
+            if not record or not url_tree.exists(iid):
+                return
+            url_tree.item(
+                iid,
+                values=(
+                    url_checkmark(record),
+                    record.get("number", ""),
+                    record.get("status", ""),
+                    record.get("url", ""),
+                ),
+            )
+        except Exception:
+            pass
+
+    def set_url_status(iid, status):
+        record = url_by_iid.get(iid)
+        if not record:
+            return
+        record["status"] = status
+        update_url_tree_row(iid)
+
+    def toggle_url_preview_checkmark(iid):
+        record = url_by_iid.get(iid)
+        if not record:
+            return
+        record["checked"] = not bool(record.get("checked", True))
+        update_url_tree_row(iid)
+
+    def clear_tree_selection(tree):
+        try:
+            tree.selection_remove(tree.selection())
+            tree.focus("")
+        except Exception:
+            pass
+
+    def on_url_tree_click(event):
+        try:
+            item_id = url_tree.identify_row(event.y)
+            region = url_tree.identify("region", event.x, event.y)
+            column_id = url_tree.identify_column(event.x)
+
+            if not item_id or region not in {"cell", "tree"}:
+                clear_tree_selection(url_tree)
+                return "break"
+
+            if column_id == "#1":
+                toggle_url_preview_checkmark(item_id)
+
+            url_tree.selection_set(item_id)
+            url_tree.focus(item_id)
+            return "break"
+        except Exception:
+            return
+
+    def on_url_tree_double_click(event):
+        try:
+            item_id = url_tree.identify_row(event.y)
+            region = url_tree.identify("region", event.x, event.y)
+            column_id = url_tree.identify_column(event.x)
+
+            if not item_id or region not in {"cell", "tree"}:
+                clear_tree_selection(url_tree)
+                return "break"
+
+            if column_id == "#1":
+                return "break"
+
+            toggle_url_preview_checkmark(item_id)
+            url_tree.selection_set(item_id)
+            url_tree.focus(item_id)
+            return "break"
+        except Exception:
+            return
+
+    def populate_preview_url_tree():
+        for item in url_tree.get_children():
+            url_tree.delete(item)
+        for record in url_records:
+            url_tree.insert(
+                "",
+                "end",
+                iid=record["iid"],
+                values=(
+                    url_checkmark(record),
+                    record.get("number", ""),
+                    record.get("status", ""),
+                    record.get("url", ""),
+                ),
+            )
+
+    def get_preview_url_records_for_scan(selected_only=False):
+        if selected_only:
+            selected_iids = list(url_tree.selection())
+            return [url_by_iid[iid] for iid in selected_iids if iid in url_by_iid]
+
+        return [record for record in url_records if bool(record.get("checked", False))]
+
+    def warn_if_many_preview_urls(count):
+        if count <= 10:
+            return True
+
+        return messagebox.askyesno(
+            "Preview many URLs?",
+            f"You are about to query {count} URL(s) for playlist preview. This can trigger source rate limits, account challenges, or IP throttling.\n\nContinue?",
+            parent=dialog,
+        )
+
+    def get_preview_pacing_seconds():
+        return preview_pacing_options.get(pacing_var.get(), (0, 5))
+
+    def sleep_before_next_preview_url(current_index, total_count):
+        if stop_event.is_set() or current_index >= total_count:
+            return
+
+        base_delay, jitter_max = get_preview_pacing_seconds()
+        jitter = random.uniform(0, jitter_max) if jitter_max > 0 else 0
+        delay = max(0, float(base_delay) + jitter)
+
+        if delay <= 0:
+            return
+
+        root.after(0, status_var.set, f"Waiting {delay:.1f}s before next preview URL...")
+        append_log(f"Preview pacing delay before next URL: {delay:.1f}s\n")
+
+        end_time = time.time() + delay
+        while time.time() < end_time:
+            if stop_event.is_set():
+                break
+            time.sleep(min(0.25, max(0, end_time - time.time())))
+
+    def detect_preview_backoff_reason(text):
+        combined = str(text or "")
+        lowered = combined.lower()
+
+        backoff_terms = [
+            "http error 429",
+            "429 too many requests",
+            "too many requests",
+            "rate limit",
+            "ratelimit",
+            "rate-limit",
+            "temporarily blocked",
+            "try again later",
+            "unusual traffic",
+            "sign in to confirm",
+            "confirm you are not a bot",
+            "confirm you're not a bot",
+            "captcha",
+            "detected unusual",
+            "temporarily unavailable due to",
+        ]
+
+        for term in backoff_terms:
+            if term in lowered:
+                return term
+
+        if re.search(r"\b429\b", lowered):
+            return "HTTP 429"
+
+        return ""
+
+    def show_preview_backoff_warning(url, reason):
+        messagebox.showwarning(
+            "Possible rate limit or challenge",
+            "Playlist preview detected a possible rate limit, bot challenge, or temporary block. "
+            "The scan was stopped so the source has time to recover.\n\n"
+            f"Reason: {reason}\n\nURL:\n{url}",
+            parent=dialog,
+        )
+
+    def clear_results():
+        playlists.clear()
+        playlist_by_iid.clear()
+        for tree in (playlist_tree, entry_tree):
+            for item in tree.get_children():
+                tree.delete(item)
+        selected_playlist_var.set("No playlist selected.")
+
+    def playlist_checkmark(record):
+        return "☑" if record.get("checked", False) else "☐"
+
+    def item_checkmark(entry):
+        return "☑" if entry.get("checked", False) else "☐"
+
+    def update_playlist_tree_row(iid):
+        try:
+            record = playlist_by_iid.get(iid)
+            if not record or not playlist_tree.exists(iid):
+                return
+            playlist_tree.item(
+                iid,
+                values=(
+                    playlist_checkmark(record),
+                    record.get("number", ""),
+                    record.get("title", ""),
+                    record.get("entry_count", 0),
+                    record.get("extractor", ""),
+                    record.get("id", ""),
+                    record.get("source_url", ""),
+                ),
+            )
+        except Exception:
+            pass
+
+    def update_entry_tree_row(iid):
+        try:
+            selected_playlist = playlist_tree.selection()
+            playlist_record = playlist_by_iid.get(selected_playlist[0]) if selected_playlist else None
+            if not playlist_record or not entry_tree.exists(iid):
+                return
+
+            entry_index = int(str(iid).split(":", 1)[1])
+            entry = playlist_record["entries"][entry_index]
+            entry_tree.item(
+                iid,
+                values=(
+                    item_checkmark(entry),
+                    entry.get("index", ""),
+                    entry.get("title", ""),
+                    entry.get("id", ""),
+                    entry.get("duration", ""),
+                    entry.get("url", ""),
+                ),
+            )
+        except Exception:
+            pass
+
+    def toggle_playlist_preview_checkmark(iid):
+        record = playlist_by_iid.get(iid)
+        if not record:
+            return
+        record["checked"] = not bool(record.get("checked", False))
+        update_playlist_tree_row(iid)
+
+    def toggle_entry_preview_checkmark(iid):
+        selected_playlist = playlist_tree.selection()
+        playlist_record = playlist_by_iid.get(selected_playlist[0]) if selected_playlist else None
+        if not playlist_record:
+            return
+
+        try:
+            entry_index = int(str(iid).split(":", 1)[1])
+            entry = playlist_record["entries"][entry_index]
+            entry["checked"] = not bool(entry.get("checked", False))
+            update_entry_tree_row(iid)
+        except Exception:
+            pass
+
+    def checked_playlist_records():
+        return [record for record in playlists if bool(record.get("checked", False))]
+
+    def selected_playlist_records():
+        selected = playlist_tree.selection()
+        records = []
+        for iid in selected:
+            record = playlist_by_iid.get(iid)
+            if record:
+                records.append(record)
+        return records
+
+    def current_playlist_record():
+        selected = selected_playlist_records()
+        if selected:
+            return selected[0]
+
+        checked = checked_playlist_records()
+        if len(checked) == 1:
+            return checked[0]
+
+        return None
+
+    def current_entry_records(checked_only=True):
+        playlist_record = current_playlist_record()
+        if not playlist_record:
+            return []
+
+        entries = playlist_record.get("entries", [])
+        if checked_only:
+            return [entry for entry in entries if bool(entry.get("checked", False))]
+
+        return list(entries)
+
+    def copy_text_to_clipboard(text_value, description):
+        text_value = str(text_value or "").strip()
+
+        if not text_value:
+            messagebox.showwarning("Nothing to copy", f"No {description} were available to copy.")
+            return
+
+        root.clipboard_clear()
+        root.clipboard_append(text_value)
+        root.update()
+        append_log(f"\nCopied {description} to clipboard.\n")
+
+    def copy_checked_playlist_urls():
+        records = checked_playlist_records()
+        urls_to_copy = [record["source_url"] for record in records if record.get("source_url")]
+        copy_text_to_clipboard("\n".join(urls_to_copy), "checked playlist URL(s)")
+
+    def copy_checked_playlist_item_urls():
+        urls_to_copy = []
+        for record in checked_playlist_records():
+            for entry in record.get("entries", []):
+                if entry.get("url"):
+                    urls_to_copy.append(entry["url"])
+
+        copy_text_to_clipboard("\n".join(urls_to_copy), "checked playlist item URL(s)")
+
+    def copy_checked_current_item_urls():
+        entries = current_entry_records(checked_only=True)
+        urls_to_copy = [entry["url"] for entry in entries if entry.get("url")]
+        copy_text_to_clipboard("\n".join(urls_to_copy), "checked playlist item URL(s)")
+
+    def copy_all_current_item_urls():
+        entries = current_entry_records(checked_only=False)
+        urls_to_copy = [entry["url"] for entry in entries if entry.get("url")]
+        copy_text_to_clipboard("\n".join(urls_to_copy), "all current playlist item URL(s)")
+
+    def copy_playlist_urls():
+        copy_checked_playlist_urls()
+
+    def copy_selected_item_urls():
+        copy_checked_current_item_urls()
+
+    def copy_all_item_urls():
+        copy_checked_playlist_item_urls()
+
+    def set_url_box_from_selected_items(append=False):
+        entries = current_entry_records(checked_only=True)
+
+        if not entries:
+            messagebox.showwarning("No checked items", "Check one or more playlist items first.")
+            return
+
+        urls_to_use = [entry["url"] for entry in entries if entry.get("url")]
+
+        if not urls_to_use:
+            messagebox.showwarning("No usable URLs", "The selected playlist items did not expose usable item URLs.")
+            return
+
+        if append:
+            append_text_to_urls_box("\n".join(urls_to_use))
+            append_log(f"\nAppended {len(urls_to_use)} playlist item URL(s) to the URL box.\n")
+        else:
+            set_url_box_urls(urls_to_use)
+            append_log(f"\nReplaced URL box with {len(urls_to_use)} playlist item URL(s).\n")
+
+    def set_playlist_items_from_selection():
+        entries = current_entry_records(checked_only=True)
+
+        if not entries:
+            messagebox.showwarning("No checked items", "Check one or more playlist items first.")
+            return
+
+        indexes = [entry.get("index") for entry in entries]
+        item_value = collapse_playlist_indexes(indexes)
+
+        if not item_value:
+            messagebox.showwarning("No usable indexes", "The selected playlist items did not expose usable playlist indexes.")
+            return
+
+        source_scope_var.set("include_playlist")
+        playlist_items_enabled_var.set(True)
+        playlist_items_var.set(item_value)
+        update_playlist_metadata_visibility()
+        update_capture_options_summary()
+        save_settings(show_popup=False)
+        append_log(f"\nSet Playlist Items from preview selection: {item_value}\n")
+        messagebox.showinfo("Playlist Items set", f"Playlist Items was set to:\n\n{item_value}")
+
+    def get_preview_item_urls_from_entries(entries):
+        urls_to_use = []
+        seen = set()
+
+        for entry in entries or []:
+            url = clean_extracted_url(entry.get("url", ""))
+            if not url_shape_is_valid(url):
+                continue
+
+            normalized = normalize_url_for_compare(url)
+            if normalized in seen:
+                continue
+
+            seen.add(normalized)
+            urls_to_use.append(url)
+
+        return urls_to_use
+
+    def get_selected_preview_item_entries_with_playlist():
+        playlist_record = current_playlist_record()
+        if not playlist_record:
+            return None, []
+
+        entries = current_entry_records(checked_only=True)
+        return playlist_record, entries
+
+    def get_preview_playlist_groups_for_queue(selected_only=True):
+        groups = []
+        records = checked_playlist_records() if selected_only else list(playlists)
+        source_label = "checked playlist(s)" if selected_only else "all detected playlist(s)"
+
+        for record in records:
+            urls = get_preview_item_urls_from_entries(record.get("entries", []))
+            if urls:
+                groups.append({
+                    "record": record,
+                    "urls": urls,
+                    "source_label": source_label,
+                })
+
+        return groups, source_label
+
+    def get_all_preview_item_entries():
+        return [
+            entry
+            for record in playlists
+            for entry in record.get("entries", [])
+        ]
+
+    def get_checked_current_preview_item_entries():
+        return current_entry_records(checked_only=True), "checked item(s)"
+
+    def get_preview_item_urls_for_action(selected_only=True):
+        if selected_only:
+            entries, source_label = get_checked_current_preview_item_entries()
+        else:
+            entries = get_all_preview_item_entries()
+            source_label = "all detected playlist item(s)"
+
+        return get_preview_item_urls_from_entries(entries), source_label
+
+    def get_playlist_case_tag_value(record, fallback_index=1):
+        record = record or {}
+        value = str(record.get("title") or record.get("id") or record.get("source_url") or "").strip()
+        return value or f"playlist{fallback_index:02d}"
+
+    def get_playlist_queue_suffix(record, fallback_index):
+        suffix = format_case_playlist_tag(get_playlist_case_tag_value(record, fallback_index))
+
+        if not suffix:
+            suffix = f"playlist{fallback_index:02d}"
+
+        return suffix[:80]
+
+    def get_playlist_preview_case_template(settings):
+        return append_playlist_tag_to_case_template((settings or {}).get("case_name", ""))
+
+    def get_preview_item_queue_settings():
+        settings = get_settings_dict()
+        settings["source_scope"] = "single"
+        settings["playlist_items_enabled"] = False
+        settings["playlist_order_enabled"] = False
+        settings["max_playlist_items_enabled"] = False
+        settings["break_on_existing"] = False
+        settings["skip_playlist_after_errors_enabled"] = False
+        return settings
+
+    def queue_preview_item_urls(selected_only=True):
+        groups, source_label = get_preview_playlist_groups_for_queue(selected_only=selected_only)
+
+        if not groups:
+            messagebox.showwarning(
+                "No item URLs",
+                "Check one or more playlist rows with usable item URLs first." if selected_only else "No detected playlist item URLs are available to queue.",
+                parent=dialog,
+            )
+            return
+
+        if not job_queue_window_is_open():
+            open_job_queue()
+
+        settings = get_preview_item_queue_settings()
+        case_template = get_playlist_preview_case_template(settings)
+        added_count = 0
+        queued_url_count = 0
+
+        for index, group in enumerate(groups, start=1):
+            record = group.get("record") or {}
+            urls_to_queue = group.get("urls", [])
+            if not urls_to_queue:
+                continue
+
+            playlist_name = get_playlist_case_tag_value(record, index)
+
+            if add_urls_to_queue_as_job(
+                urls_to_queue,
+                settings=settings,
+                case_template=case_template,
+                playlist_name=playlist_name,
+            ):
+                added_count += 1
+                queued_url_count += len(urls_to_queue)
+
+        if added_count:
+            append_log(
+                f"\nQueued {queued_url_count} playlist preview item URL(s) from {source_label} "
+                f"as {added_count} playlist-split queue job(s).\n"
+            )
+
+    def split_and_queue_preview_item_urls(selected_only=True):
+        urls_to_queue, source_label = get_preview_item_urls_for_action(selected_only=selected_only)
+
+        if not urls_to_queue:
+            messagebox.showwarning(
+                "No item URLs",
+                "Check one or more playlist item rows with usable item URLs first." if selected_only else "No detected playlist item URLs are available.",
+                parent=dialog,
+            )
+            return
+
+        mode, value = show_split_queue_dialog(len(urls_to_queue))
+        if not mode or not value:
+            return
+
+        if mode == "per_group":
+            groups = split_urls_by_count(urls_to_queue, value)
+            split_label = f"{value} URL(s) per group"
+        else:
+            groups = split_urls_by_group_count(urls_to_queue, value)
+            split_label = f"{value} requested group(s)"
+
+        if not groups:
+            messagebox.showinfo("No groups created", "No URL groups were created.", parent=dialog)
+            return
+
+        if not job_queue_window_is_open():
+            open_job_queue()
+
+        settings = get_preview_item_queue_settings()
+        playlist_record = current_playlist_record()
+        playlist_name = get_playlist_case_tag_value(playlist_record, 1)
+        case_template = get_playlist_preview_case_template(settings)
+        added_count = 0
+
+        for index, group_urls in enumerate(groups, start=1):
+            part_case_template = f"{case_template}-part{index:02d}"
+            if add_urls_to_queue_as_job(
+                group_urls,
+                settings=settings,
+                case_template=part_case_template,
+                playlist_name=playlist_name,
+            ):
+                added_count += 1
+
+        append_log(
+            f"\nSplit {len(urls_to_queue)} playlist preview item URL(s) from {source_label} "
+            f"into {added_count} queue job(s) using {split_label}.\n"
+        )
+
+    def export_preview_json():
+        if not playlists:
+            messagebox.showwarning("No preview data", "No playlist preview data is available to export.", parent=dialog)
+            return
+
+        initial_file = f"playlist-preview-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+        path = filedialog.asksaveasfilename(
+            title="Export Playlist Preview JSON",
+            defaultextension=".json",
+            initialdir=ROOT,
+            initialfile=initial_file,
+            filetypes=[
+                ("JSON files", "*.json"),
+                ("All files", "*.*"),
+            ],
+            parent=dialog,
+        )
+
+        if not path:
+            return
+
+        export_playlists = []
+
+        for record in playlists:
+            clean_record = {
+                "source_url": record.get("source_url", ""),
+                "title": record.get("title", ""),
+                "entry_count": record.get("entry_count", 0),
+                "extractor": record.get("extractor", ""),
+                "id": record.get("id", ""),
+                "entries": record.get("entries", []),
+            }
+            export_playlists.append(clean_record)
+
+        payload = {
+            "app": APP_TITLE,
+            "app_version": APP_VERSION,
+            "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source_url_count": len(urls),
+            "playlist_count": len(export_playlists),
+            "preview_mode": "yt-dlp --flat-playlist --dump-single-json",
+            "playlists": export_playlists,
+        }
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+
+            append_log(f"\nExported playlist preview JSON: {path}\n")
+            messagebox.showinfo("Export complete", f"Playlist preview JSON was exported to:\n\n{path}", parent=dialog)
+        except Exception as e:
+            messagebox.showerror("Export failed", f"Could not export playlist preview JSON:\n\n{e}", parent=dialog)
+
+    def populate_entries(record):
+        for item in entry_tree.get_children():
+            entry_tree.delete(item)
+
+        if not record:
+            selected_playlist_var.set("No playlist selected.")
+            return
+
+        selected_playlist_var.set(
+            f"{record.get('title') or '(untitled playlist)'} - {len(record.get('entries', []))} item(s)"
+        )
+
+        for entry_number, entry in enumerate(record.get("entries", [])):
+            entry.setdefault("checked", True)
+            iid = f"{record['iid']}:{entry_number}"
+            entry_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    item_checkmark(entry),
+                    entry.get("index", ""),
+                    entry.get("title", ""),
+                    entry.get("id", ""),
+                    entry.get("duration", ""),
+                    entry.get("url", ""),
+                ),
+            )
+
+    def on_playlist_selected(event=None):
+        selected = playlist_tree.selection()
+        record = playlist_by_iid.get(selected[0]) if selected else None
+        populate_entries(record)
+
+    def on_playlist_tree_click(event):
+        try:
+            item_id = playlist_tree.identify_row(event.y)
+            region = playlist_tree.identify("region", event.x, event.y)
+            column_id = playlist_tree.identify_column(event.x)
+
+            if not item_id or region not in {"cell", "tree"}:
+                clear_tree_selection(playlist_tree)
+                populate_entries(None)
+                return "break"
+
+            if column_id == "#1":
+                toggle_playlist_preview_checkmark(item_id)
+
+            playlist_tree.selection_set(item_id)
+            playlist_tree.focus(item_id)
+            populate_entries(playlist_by_iid.get(item_id))
+            return "break"
+        except Exception:
+            return
+
+    def on_playlist_tree_double_click(event):
+        try:
+            item_id = playlist_tree.identify_row(event.y)
+            region = playlist_tree.identify("region", event.x, event.y)
+            column_id = playlist_tree.identify_column(event.x)
+
+            if not item_id or region not in {"cell", "tree"}:
+                clear_tree_selection(playlist_tree)
+                populate_entries(None)
+                return "break"
+
+            if column_id == "#1":
+                return "break"
+
+            toggle_playlist_preview_checkmark(item_id)
+            playlist_tree.selection_set(item_id)
+            playlist_tree.focus(item_id)
+            populate_entries(playlist_by_iid.get(item_id))
+            return "break"
+        except Exception:
+            return
+
+    def on_entry_tree_click(event):
+        try:
+            item_id = entry_tree.identify_row(event.y)
+            region = entry_tree.identify("region", event.x, event.y)
+            column_id = entry_tree.identify_column(event.x)
+
+            if not item_id or region not in {"cell", "tree"}:
+                clear_tree_selection(entry_tree)
+                return "break"
+
+            if column_id == "#1":
+                toggle_entry_preview_checkmark(item_id)
+
+            entry_tree.selection_set(item_id)
+            entry_tree.focus(item_id)
+            return "break"
+        except Exception:
+            return
+
+    def on_entry_tree_double_click(event):
+        try:
+            item_id = entry_tree.identify_row(event.y)
+            region = entry_tree.identify("region", event.x, event.y)
+            column_id = entry_tree.identify_column(event.x)
+
+            if not item_id or region not in {"cell", "tree"}:
+                clear_tree_selection(entry_tree)
+                return "break"
+
+            if column_id == "#1":
+                return "break"
+
+            toggle_entry_preview_checkmark(item_id)
+            entry_tree.selection_set(item_id)
+            entry_tree.focus(item_id)
+            return "break"
+        except Exception:
+            return
+
+    def add_playlist_result(record):
+        if not dialog.winfo_exists():
+            return
+
+        record["iid"] = f"playlist-{len(playlists)}"
+        record["number"] = len(playlists) + 1
+        record.setdefault("checked", True)
+        playlists.append(record)
+        playlist_by_iid[record["iid"]] = record
+
+        playlist_tree.insert(
+            "",
+            "end",
+            iid=record["iid"],
+            values=(
+                playlist_checkmark(record),
+                record.get("number", ""),
+                record.get("title", ""),
+                record.get("entry_count", 0),
+                record.get("extractor", ""),
+                record.get("id", ""),
+                record.get("source_url", ""),
+            ),
+        )
+
+        if len(playlists) == 1:
+            playlist_tree.selection_set(record["iid"])
+            playlist_tree.focus(record["iid"])
+            populate_entries(record)
+
+    def add_non_playlist_status(index, url, detail):
+        if dialog.winfo_exists():
+            status_var.set(f"Scanned {index}/{len(urls)}. Latest non-playlist: {detail[:120]}")
+
+    def scan_worker(scan_records):
+        total_count = len(scan_records)
+
+        for index, record in enumerate(scan_records, start=1):
+            if stop_event.is_set():
+                break
+
+            url = record.get("url", "")
+            iid = record.get("iid", "")
+
+            root.after(0, set_url_status, iid, "Scanning")
+            root.after(0, status_var.set, f"Scanning {index}/{total_count}: {url[:140]}")
+
+            try:
+                cmd = build_playlist_preview_command(url)
+                append_log(f"\nPreviewing playlist URL {index}/{total_count}:\n{format_command_for_log(cmd)}\n")
+                result = subprocess.run(
+                    cmd,
+                    cwd=os.path.dirname(os.path.abspath(yt_dlp_path_var.get().strip())) or ROOT,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+
+                combined_output = "\n".join(
+                    part for part in [result.stdout, result.stderr] if part
+                )
+                backoff_reason = detect_preview_backoff_reason(combined_output)
+
+                if backoff_reason:
+                    root.after(0, set_url_status, iid, "Backoff")
+                    root.after(0, add_non_playlist_status, index, url, f"suspected rate limit/backoff: {backoff_reason}")
+                    root.after(0, show_preview_backoff_warning, url, backoff_reason)
+                    stop_event.set()
+                    break
+
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
+                    root.after(0, set_url_status, iid, "Failed")
+                    root.after(0, add_non_playlist_status, index, url, f"yt-dlp failed: {detail}")
+                    sleep_before_next_preview_url(index, total_count)
+                    continue
+
+                data = extract_json_object_from_stdout(result.stdout)
+                entries = data.get("entries", [])
+
+                if not isinstance(entries, list) or not entries:
+                    root.after(0, set_url_status, iid, "No playlist")
+                    root.after(0, add_non_playlist_status, index, url, "no playlist entries returned")
+                    sleep_before_next_preview_url(index, total_count)
+                    continue
+
+                item_rows = []
+                for item_index, entry in enumerate(entries, start=1):
+                    entry = entry if isinstance(entry, dict) else {}
+                    playlist_index = entry.get("playlist_index") or entry.get("n_entries")
+                    if not str(playlist_index or "").strip():
+                        playlist_index = item_index
+
+                    item_rows.append({
+                        "checked": True,
+                        "index": playlist_index,
+                        "title": str(entry.get("title") or "").strip(),
+                        "id": str(entry.get("id") or "").strip(),
+                        "duration": format_preview_duration(entry.get("duration")),
+                        "url": get_playlist_entry_url(entry, data),
+                    })
+
+                record_payload = {
+                    "source_url": url,
+                    "title": str(data.get("title") or data.get("playlist_title") or url).strip(),
+                    "entry_count": len(item_rows),
+                    "extractor": str(data.get("extractor_key") or data.get("extractor") or "").strip(),
+                    "id": str(data.get("id") or "").strip(),
+                    "entries": item_rows,
+                }
+
+                root.after(0, set_url_status, iid, f"Playlist: {len(item_rows)}")
+                root.after(0, add_playlist_result, record_payload)
+
+            except Exception as e:
+                message_text = str(e)
+                backoff_reason = detect_preview_backoff_reason(message_text)
+                if backoff_reason:
+                    root.after(0, set_url_status, iid, "Backoff")
+                    root.after(0, add_non_playlist_status, index, url, f"suspected rate limit/backoff: {backoff_reason}")
+                    root.after(0, show_preview_backoff_warning, url, backoff_reason)
+                    stop_event.set()
+                    break
+
+                root.after(0, set_url_status, iid, "Error")
+                root.after(0, add_non_playlist_status, index, url, f"error: {e}")
+
+            sleep_before_next_preview_url(index, total_count)
+
+        def finish():
+            if not dialog.winfo_exists():
+                return
+
+            set_buttons_scanning(False)
+            if stop_event.is_set():
+                status_var.set(f"Scan stopped. Found {len(playlists)} playlist URL(s).")
+            else:
+                status_var.set(f"Scan complete. Found {len(playlists)} playlist URL(s) from {total_count} queried URL(s).")
+
+            append_log(f"\nPlaylist preview finished. Found {len(playlists)} playlist URL(s).\n")
+
+        root.after(0, finish)
+
+    def start_scan(selected_only=False):
+        if scan_running["value"]:
+            return
+
+        try:
+            yt_dlp_path = yt_dlp_path_var.get().strip()
+            if not yt_dlp_path or not os.path.isfile(yt_dlp_path):
+                raise ValueError("yt-dlp path is missing or invalid.")
+        except Exception as e:
+            messagebox.showerror("yt-dlp not found", str(e), parent=dialog)
+            return
+
+        scan_records = get_preview_url_records_for_scan(selected_only=selected_only)
+
+        if not scan_records:
+            messagebox.showwarning(
+                "No URLs selected",
+                "Select one or more URL rows or check one or more URLs before starting preview.",
+                parent=dialog,
+            )
+            return
+
+        if not warn_if_many_preview_urls(len(scan_records)):
+            return
+
+        clear_results()
+
+        for record in url_records:
+            if record in scan_records:
+                record["status"] = "Queued"
+            elif record.get("status") in {"Queued", "Scanning", "No playlist", "Failed", "Error", "Backoff"}:
+                record["status"] = "Ready"
+            update_url_tree_row(record["iid"])
+
+        stop_event.clear()
+        set_buttons_scanning(True)
+        append_log(
+            f"\nStarting playlist preview scan for {len(scan_records)} URL(s). "
+            f"Pacing: {pacing_var.get()}.\n"
+        )
+        threading.Thread(target=lambda: scan_worker(scan_records), daemon=True).start()
+
+    def stop_scan():
+        stop_event.set()
+        status_var.set("Stopping playlist preview after current URL...")
+
+    def close_dialog():
+        stop_event.set()
+        try:
+            app_notebook.select(main)
+        except Exception:
+            pass
+
+    def pack_preview_button(widget):
+        widget.pack(side="left", padx=(0, 6), pady=2)
+
+    def selected_url_records():
+        return [url_by_iid[iid] for iid in url_tree.selection() if iid in url_by_iid]
+
+    def copy_selected_preview_urls():
+        records = selected_url_records()
+        urls_to_copy = [record.get("url", "") for record in records if record.get("url")]
+        copy_text_to_clipboard("\n".join(urls_to_copy), "selected preview URL(s)")
+
+    def set_selected_url_checks(checked):
+        records = selected_url_records()
+        if not records:
+            messagebox.showwarning("No URL selection", "Select one or more URL rows first.", parent=dialog)
+            return
+
+        for record in records:
+            record["checked"] = bool(checked)
+            update_url_tree_row(record["iid"])
+
+    def set_all_url_checks(checked):
+        for record in url_records:
+            record["checked"] = bool(checked)
+            update_url_tree_row(record["iid"])
+
+    def invert_url_checks():
+        for record in url_records:
+            record["checked"] = not bool(record.get("checked", False))
+            update_url_tree_row(record["iid"])
+
+    def set_all_playlist_checks(checked):
+        for record in playlists:
+            record["checked"] = bool(checked)
+            update_playlist_tree_row(record.get("iid", ""))
+
+    def set_all_current_item_checks(checked):
+        playlist_record = current_playlist_record()
+        if not playlist_record:
+            return
+
+        for entry in playlist_record.get("entries", []):
+            entry["checked"] = bool(checked)
+
+        for iid in entry_tree.get_children():
+            update_entry_tree_row(iid)
+
+    def invert_current_item_checks():
+        playlist_record = current_playlist_record()
+        if not playlist_record:
+            return
+
+        for entry in playlist_record.get("entries", []):
+            entry["checked"] = not bool(entry.get("checked", False))
+
+        for iid in entry_tree.get_children():
+            update_entry_tree_row(iid)
+
+    def select_all_preview_items():
+        children = entry_tree.get_children()
+        if children:
+            entry_tree.selection_set(children)
+            set_all_current_item_checks(True)
+
+    def show_tree_context_menu(event, tree, menu):
+        try:
+            iid = tree.identify_row(event.y)
+            if iid and iid not in tree.selection():
+                tree.selection_set(iid)
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
+        return "break"
+
+    url_action_frame = ttk.LabelFrame(dialog, text="URL Preview Actions", padding=8)
+    url_action_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
+
+    start_button = ttk.Button(url_action_frame, text="Start Checked", command=lambda: start_scan(False))
+    pack_preview_button(start_button)
+    start_selected_button = ttk.Button(url_action_frame, text="Start Selected", command=lambda: start_scan(True))
+    pack_preview_button(start_selected_button)
+    stop_button = ttk.Button(url_action_frame, text="Stop", command=stop_scan, state="disabled")
+    pack_preview_button(stop_button)
+    pack_preview_button(ttk.Button(url_action_frame, text="Check All", command=lambda: set_all_url_checks(True)))
+    pack_preview_button(ttk.Button(url_action_frame, text="Uncheck All", command=lambda: set_all_url_checks(False)))
+    pack_preview_button(ttk.Button(url_action_frame, text="Invert Checks", command=invert_url_checks))
+    pack_preview_button(ttk.Button(url_action_frame, text="Copy Selected URL(s)", command=copy_selected_preview_urls))
+
+    url_frame = ttk.LabelFrame(dialog, text="URLs to Preview", padding=8)
+    url_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 8))
+    url_frame.columnconfigure(0, weight=1)
+    url_frame.rowconfigure(0, weight=1)
+
+    url_tree = ttk.Treeview(
+        url_frame,
+        columns=("selected", "number", "status", "url"),
+        show="headings",
+        selectmode="browse",
+        height=8,
+    )
+    url_tree.heading("selected", text="Use")
+    url_tree.heading("number", text="#")
+    url_tree.heading("status", text="Status")
+    url_tree.heading("url", text="URL")
+    url_tree.column("selected", width=55, anchor="center", stretch=False)
+    url_tree.column("number", width=55, anchor="e", stretch=False)
+    url_tree.column("status", width=130, stretch=False)
+    url_tree.column("url", width=900)
+    url_tree.grid(row=0, column=0, sticky="nsew")
+
+    url_scroll_y = ttk.Scrollbar(url_frame, orient="vertical", command=url_tree.yview)
+    url_scroll_y.grid(row=0, column=1, sticky="ns")
+    url_scroll_x = ttk.Scrollbar(url_frame, orient="horizontal", command=url_tree.xview)
+    url_scroll_x.grid(row=1, column=0, sticky="ew")
+    url_tree.configure(yscrollcommand=url_scroll_y.set, xscrollcommand=url_scroll_x.set)
+    url_tree.bind("<Button-1>", on_url_tree_click)
+    url_tree.bind("<Double-1>", on_url_tree_double_click)
+    populate_preview_url_tree()
+
+    playlist_action_frame = ttk.LabelFrame(dialog, text="Playlist Actions", padding=8)
+    playlist_action_frame.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 6))
+
+    pack_preview_button(ttk.Button(playlist_action_frame, text="Copy Checked Playlist URL(s)", command=copy_checked_playlist_urls))
+    pack_preview_button(ttk.Button(playlist_action_frame, text="Copy Items from Checked", command=copy_checked_playlist_item_urls))
+    pack_preview_button(ttk.Button(playlist_action_frame, text="Queue Checked Playlist(s)", command=lambda: queue_preview_item_urls(True)))
+    pack_preview_button(ttk.Button(playlist_action_frame, text="Queue All Playlist(s)", command=lambda: queue_preview_item_urls(False)))
+    pack_preview_button(ttk.Button(playlist_action_frame, text="Check All", command=lambda: set_all_playlist_checks(True)))
+    pack_preview_button(ttk.Button(playlist_action_frame, text="Uncheck All", command=lambda: set_all_playlist_checks(False)))
+    pack_preview_button(ttk.Button(playlist_action_frame, text="Export JSON", command=export_preview_json))
+
+    playlist_frame = ttk.LabelFrame(dialog, text="Playlists Found", padding=8)
+    playlist_frame.grid(row=4, column=0, sticky="nsew", padx=12, pady=(0, 8))
+    playlist_frame.columnconfigure(0, weight=1)
+    playlist_frame.rowconfigure(0, weight=1)
+
+    playlist_tree = ttk.Treeview(
+        playlist_frame,
+        columns=("selected", "number", "title", "entries", "extractor", "id", "url"),
+        show="headings",
+        selectmode="browse",
+        height=8,
+    )
+    playlist_tree.heading("selected", text="Select")
+    playlist_tree.heading("number", text="#")
+    playlist_tree.heading("title", text="Title")
+    playlist_tree.heading("entries", text="Items")
+    playlist_tree.heading("extractor", text="Source")
+    playlist_tree.heading("id", text="ID")
+    playlist_tree.heading("url", text="URL")
+    playlist_tree.column("selected", width=70, anchor="center", stretch=False)
+    playlist_tree.column("number", width=45, anchor="e", stretch=False)
+    playlist_tree.column("title", width=300)
+    playlist_tree.column("entries", width=70, anchor="e", stretch=False)
+    playlist_tree.column("extractor", width=110, stretch=False)
+    playlist_tree.column("id", width=140)
+    playlist_tree.column("url", width=390)
+    playlist_tree.grid(row=0, column=0, sticky="nsew")
+
+    playlist_scroll_y = ttk.Scrollbar(playlist_frame, orient="vertical", command=playlist_tree.yview)
+    playlist_scroll_y.grid(row=0, column=1, sticky="ns")
+    playlist_scroll_x = ttk.Scrollbar(playlist_frame, orient="horizontal", command=playlist_tree.xview)
+    playlist_scroll_x.grid(row=1, column=0, sticky="ew")
+    playlist_tree.configure(yscrollcommand=playlist_scroll_y.set, xscrollcommand=playlist_scroll_x.set)
+    playlist_tree.bind("<<TreeviewSelect>>", on_playlist_selected)
+    playlist_tree.bind("<Button-1>", on_playlist_tree_click)
+    playlist_tree.bind("<Double-1>", on_playlist_tree_double_click)
+
+    ttk.Label(dialog, textvariable=selected_playlist_var, padding=(12, 2, 12, 4)).grid(row=5, column=0, sticky="ew")
+
+    item_action_frame = ttk.LabelFrame(dialog, text="Playlist Item Actions", padding=8)
+    item_action_frame.grid(row=6, column=0, sticky="ew", padx=12, pady=(0, 6))
+
+    pack_preview_button(ttk.Button(item_action_frame, text="Copy Checked Item URL(s)", command=copy_selected_item_urls))
+    pack_preview_button(ttk.Button(item_action_frame, text="Copy All Item URL(s)", command=copy_all_current_item_urls))
+    pack_preview_button(ttk.Button(item_action_frame, text="Use Checked in URL Box", command=lambda: set_url_box_from_selected_items(False)))
+    pack_preview_button(ttk.Button(item_action_frame, text="Append Checked", command=lambda: set_url_box_from_selected_items(True)))
+    pack_preview_button(ttk.Button(item_action_frame, text="Split and Queue Checked", command=lambda: split_and_queue_preview_item_urls(True)))
+    pack_preview_button(ttk.Button(item_action_frame, text="Set Playlist Items", command=set_playlist_items_from_selection))
+    pack_preview_button(ttk.Button(item_action_frame, text="Check All Items", command=lambda: set_all_current_item_checks(True)))
+    pack_preview_button(ttk.Button(item_action_frame, text="Uncheck All Items", command=lambda: set_all_current_item_checks(False)))
+
+    entries_frame = ttk.LabelFrame(dialog, text="Playlist Items", padding=8)
+    entries_frame.grid(row=7, column=0, sticky="nsew", padx=12, pady=(0, 8))
+    entries_frame.columnconfigure(0, weight=1)
+    entries_frame.rowconfigure(0, weight=1)
+
+    entry_tree = ttk.Treeview(
+        entries_frame,
+        columns=("selected", "index", "title", "id", "duration", "url"),
+        show="headings",
+        selectmode="browse",
+        height=8,
+    )
+    entry_tree.heading("selected", text="Select")
+    entry_tree.heading("index", text="Index")
+    entry_tree.heading("title", text="Title")
+    entry_tree.heading("id", text="ID")
+    entry_tree.heading("duration", text="Duration")
+    entry_tree.heading("url", text="URL")
+    entry_tree.column("selected", width=70, anchor="center", stretch=False)
+    entry_tree.column("index", width=70, anchor="e", stretch=False)
+    entry_tree.column("title", width=360)
+    entry_tree.column("id", width=140)
+    entry_tree.column("duration", width=90, stretch=False)
+    entry_tree.column("url", width=420)
+    entry_tree.grid(row=0, column=0, sticky="nsew")
+
+    entry_scroll_y = ttk.Scrollbar(entries_frame, orient="vertical", command=entry_tree.yview)
+    entry_scroll_y.grid(row=0, column=1, sticky="ns")
+    entry_scroll_x = ttk.Scrollbar(entries_frame, orient="horizontal", command=entry_tree.xview)
+    entry_scroll_x.grid(row=1, column=0, sticky="ew")
+    entry_tree.configure(yscrollcommand=entry_scroll_y.set, xscrollcommand=entry_scroll_x.set)
+    entry_tree.bind("<Button-1>", on_entry_tree_click)
+    entry_tree.bind("<Double-1>", on_entry_tree_double_click)
+
+    url_context_menu = tk.Menu(dialog, tearoff=False)
+    url_context_menu.add_command(label="Toggle Check", command=lambda: [toggle_url_preview_checkmark(iid) for iid in url_tree.selection()])
+    url_context_menu.add_command(label="Check Selected", command=lambda: set_selected_url_checks(True))
+    url_context_menu.add_command(label="Uncheck Selected", command=lambda: set_selected_url_checks(False))
+    url_context_menu.add_separator()
+    url_context_menu.add_command(label="Check All", command=lambda: set_all_url_checks(True))
+    url_context_menu.add_command(label="Uncheck All", command=lambda: set_all_url_checks(False))
+    url_context_menu.add_command(label="Invert Checks", command=invert_url_checks)
+    url_context_menu.add_separator()
+    url_context_menu.add_command(label="Start Checked", command=lambda: start_scan(False))
+    url_context_menu.add_command(label="Start Selected", command=lambda: start_scan(True))
+    url_context_menu.add_command(label="Copy Selected URL(s)", command=copy_selected_preview_urls)
+
+    playlist_context_menu = tk.Menu(dialog, tearoff=False)
+    playlist_context_menu.add_command(label="Toggle Check", command=lambda: [toggle_playlist_preview_checkmark(iid) for iid in playlist_tree.selection()])
+    playlist_context_menu.add_command(label="Check All", command=lambda: set_all_playlist_checks(True))
+    playlist_context_menu.add_command(label="Uncheck All", command=lambda: set_all_playlist_checks(False))
+    playlist_context_menu.add_separator()
+    playlist_context_menu.add_command(label="Copy Checked Playlist URL(s)", command=copy_checked_playlist_urls)
+    playlist_context_menu.add_command(label="Copy Items from Checked", command=copy_checked_playlist_item_urls)
+    playlist_context_menu.add_separator()
+    playlist_context_menu.add_command(label="Queue Checked Playlist(s)", command=lambda: queue_preview_item_urls(True))
+    playlist_context_menu.add_command(label="Queue All Playlist(s)", command=lambda: queue_preview_item_urls(False))
+    playlist_context_menu.add_separator()
+    playlist_context_menu.add_command(label="Export JSON", command=export_preview_json)
+
+    entry_context_menu = tk.Menu(dialog, tearoff=False)
+    entry_context_menu.add_command(label="Toggle Check", command=lambda: [toggle_entry_preview_checkmark(iid) for iid in entry_tree.selection()])
+    entry_context_menu.add_command(label="Check All Items", command=lambda: set_all_current_item_checks(True))
+    entry_context_menu.add_command(label="Uncheck All Items", command=lambda: set_all_current_item_checks(False))
+    entry_context_menu.add_command(label="Invert Item Checks", command=invert_current_item_checks)
+    entry_context_menu.add_separator()
+    entry_context_menu.add_command(label="Copy Checked Item URL(s)", command=copy_selected_item_urls)
+    entry_context_menu.add_command(label="Copy All Item URL(s)", command=copy_all_current_item_urls)
+    entry_context_menu.add_separator()
+    entry_context_menu.add_command(label="Use Checked in URL Box", command=lambda: set_url_box_from_selected_items(False))
+    entry_context_menu.add_command(label="Append Checked", command=lambda: set_url_box_from_selected_items(True))
+    entry_context_menu.add_separator()
+    entry_context_menu.add_command(label="Split and Queue Checked", command=lambda: split_and_queue_preview_item_urls(True))
+    entry_context_menu.add_command(label="Set Playlist Items", command=set_playlist_items_from_selection)
+
+    url_tree.bind("<Button-3>", lambda event: show_tree_context_menu(event, url_tree, url_context_menu))
+    playlist_tree.bind("<Button-3>", lambda event: show_tree_context_menu(event, playlist_tree, playlist_context_menu))
+    entry_tree.bind("<Button-3>", lambda event: show_tree_context_menu(event, entry_tree, entry_context_menu))
+
+    try:
+        configure_tk_widget_theme(dialog, get_theme_colors())
+    except Exception:
+        pass
+
+    playlist_preview_tab_loaded = True
+    playlist_preview_loaded_signature = playlist_preview_source_signature
+    status_var.set(f"Loaded {len(urls)} URL(s). Press Start Checked to scan checked URLs or Start Selected to scan selected rows.")
+
+
 def check_impersonate_targets():
     yt_dlp_path = yt_dlp_path_var.get().strip()
 
@@ -9196,6 +11241,49 @@ def normalize_format_strategy(value):
     return "best"
 
 
+def normalize_playlist_order(value):
+    value = str(value or "").strip().lower()
+    if value in {"normal", "reverse", "random"}:
+        return value
+    return "normal"
+
+
+def script_playlist_order(value):
+    return {
+        "normal": "Normal",
+        "reverse": "Reverse",
+        "random": "Random",
+    }.get(normalize_playlist_order(value), "Normal")
+
+
+def normalize_optional_positive_int_string(value):
+    value = str(value or "").strip()
+
+    if not value:
+        return ""
+
+    if not value.isdigit():
+        return ""
+
+    parsed = int(value)
+    if parsed <= 0:
+        return ""
+
+    return str(parsed)
+
+
+def normalize_playlist_items(value):
+    value = re.sub(r"\s+", "", str(value or ""))
+
+    if not value:
+        return ""
+
+    if re.fullmatch(r"[0-9,:\-]+", value):
+        return value
+
+    return ""
+
+
 def normalize_gui_cache_mode(value):
     value = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
 
@@ -9404,14 +11492,42 @@ def on_http_chunk_size_commit(event=None):
 
 def update_capture_options_summary(*args):
     try:
-        if capture_mode_var.get() == "metadata_only":
-            mode = "Metadata only"
-        elif capture_mode_var.get() == "media_only":
-            mode = "Media only"
-        else:
-            mode = "Media + artifacts"
+        capture_mode = normalize_capture_mode(capture_mode_var.get())
 
-        scope = "Include playlist" if source_scope_var.get() == "include_playlist" else "Single item"
+        if capture_mode == "metadata_only":
+            mode = "Metadata only"
+        elif capture_mode == "media_only":
+            mode = "Media only"
+        elif capture_mode == "media_embedded":
+            mode = "Media + embedded"
+        else:
+            mode = "Media + sidecars"
+
+        include_playlist = source_scope_var.get() == "include_playlist"
+        scope = "Include playlist" if include_playlist else "Single item"
+
+        playlist_bits = []
+        if include_playlist:
+            if playlist_items_enabled_var.get():
+                playlist_items = normalize_playlist_items(playlist_items_var.get())
+                playlist_bits.append(f"items {playlist_items}" if playlist_items else "items invalid")
+
+            if playlist_order_enabled_var.get():
+                playlist_order = normalize_playlist_order(playlist_order_var.get())
+                playlist_bits.append(f"order {playlist_order}")
+
+            if max_playlist_items_enabled_var.get():
+                max_playlist_items = normalize_optional_positive_int_string(max_playlist_items_var.get())
+                playlist_bits.append(f"max {max_playlist_items}" if max_playlist_items else "max invalid")
+
+            if break_on_existing_var.get():
+                playlist_bits.append("break existing")
+
+            if skip_playlist_after_errors_enabled_var.get():
+                skip_errors = normalize_optional_positive_int_string(skip_playlist_after_errors_var.get())
+                playlist_bits.append(f"skip after {skip_errors} errors" if skip_errors else "skip errors invalid")
+
+        playlist_text = f"playlist {'; '.join(playlist_bits)}" if playlist_bits else ("playlist all" if include_playlist else "playlist off")
 
         archive_names = {
             "use": "case archive",
@@ -9487,6 +11603,18 @@ def update_capture_options_summary(*args):
         if keep_partials_var.get():
             artifacts.append("partials")
 
+        embeds = []
+        if embed_metadata_var.get():
+            embeds.append("metadata")
+        if embed_thumbnail_var.get():
+            embeds.append("thumbnail")
+        if embed_subs_var.get():
+            embeds.append("subs")
+        if embed_chapters_var.get():
+            embeds.append("chapters")
+        if embed_info_json_var.get():
+            embeds.append("info JSON")
+
         date_filters = []
         if date_after_enabled_var.get():
             date_filters.append("after")
@@ -9496,12 +11624,26 @@ def update_capture_options_summary(*args):
         if date_filters:
             artifacts.append("date " + "/".join(date_filters))
 
-        if capture_mode_var.get() == "media_only":
-            artifact_text = "requested sidecars ignored"
+        if capture_mode == "media_only":
+            artifact_text = "metadata options ignored"
+        elif capture_mode == "media_embedded":
+            embed_text = ", ".join(embeds) if embeds else "no embeds selected"
+            artifact_text = f"sidecars ignored; embeds: {embed_text}"
+        elif capture_mode == "metadata_only":
+            sidecar_text = ", ".join(artifacts) if artifacts else "no sidecars"
+            artifact_text = f"{sidecar_text}; embeds ignored"
         else:
-            artifact_text = ", ".join(artifacts) if artifacts else "no sidecars"
+            sidecar_text = ", ".join(artifacts) if artifacts else "no sidecars"
+            embed_text = ", ".join(embeds) if embeds else "embeds off"
+            artifact_text = f"{sidecar_text}; embeds: {embed_text}"
 
-        capture_options_summary_var.set(f"{mode}; {scope}; {archive_text}; {resolution_text}; {cache_text}; {manifest_text}; {rate_text}; {speed_text}; {retry_text}; {throttle_text}; {chunk_text}; {concurrency_text}; {fragments_text}; {failure_text}; {artifact_text}")
+        capture_options_summary_var.set(f"{mode}; {scope}; {playlist_text}; {archive_text}; {resolution_text}; {cache_text}; {manifest_text}; {rate_text}; {speed_text}; {retry_text}; {throttle_text}; {chunk_text}; {concurrency_text}; {fragments_text}; {failure_text}; {artifact_text}")
+
+        try:
+            update_metadata_options_state()
+            update_playlist_options_state()
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -9514,6 +11656,20 @@ def hide_capture_options_panel(save=False):
         pass
 
     capture_options_button.config(text="Capture Options ▾")
+
+    if save:
+        update_capture_options_summary()
+        save_settings(show_popup=False)
+
+
+def hide_metadata_options_panel(save=False):
+    try:
+        if metadata_options_panel.winfo_ismapped():
+            metadata_options_panel.grid_remove()
+    except Exception:
+        pass
+
+    metadata_options_button.config(text="Metadata Options ▾")
 
     if save:
         update_capture_options_summary()
@@ -9553,6 +11709,7 @@ def toggle_capture_options_panel():
         hide_capture_options_panel(save=True)
         return
 
+    hide_metadata_options_panel(save=True)
     hide_advanced_options_panel(save=True)
     hide_pacing_options_panel(save=True)
     update_capture_options_summary()
@@ -9573,16 +11730,101 @@ def close_capture_options_panel():
     hide_capture_options_panel(save=True)
 
 
+def toggle_metadata_options_panel():
+    if metadata_options_panel.winfo_ismapped():
+        hide_metadata_options_panel(save=True)
+        return
+
+    hide_capture_options_panel(save=True)
+    hide_advanced_options_panel(save=True)
+    hide_pacing_options_panel(save=True)
+    update_capture_options_summary()
+    metadata_options_panel.grid(
+        row=8,
+        column=0,
+        columnspan=4,
+        rowspan=8,
+        sticky="nsew",
+        padx=0,
+        pady=(8, 0),
+    )
+    metadata_options_panel.tkraise()
+    metadata_options_button.config(text="Metadata Options ▴")
+
+
+def close_metadata_options_panel():
+    hide_metadata_options_panel(save=True)
+
+
+def update_metadata_options_state():
+    try:
+        capture_mode = normalize_capture_mode(capture_mode_var.get())
+        sidecars_enabled = capture_mode in {"media", "metadata_only"}
+        embeds_enabled = capture_mode in {"media", "media_embedded"}
+
+        sidecar_state = "normal" if sidecars_enabled else "disabled"
+        embed_state = "normal" if embeds_enabled else "disabled"
+
+        for widget in globals().get("sidecar_option_widgets", []):
+            try:
+                widget.configure(state=sidecar_state)
+            except Exception:
+                pass
+
+        for widget in globals().get("embed_option_widgets", []):
+            try:
+                widget.configure(state=embed_state)
+            except Exception:
+                pass
+
+        try:
+            playlist_metadata_check.configure(state=sidecar_state)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def update_playlist_options_state():
+    try:
+        playlist_enabled = source_scope_var.get() == "include_playlist"
+
+        for item in globals().get("playlist_option_widgets", []):
+            try:
+                if len(item) == 2:
+                    widget, widget_type = item
+                    controlling_var = None
+                else:
+                    widget, widget_type, controlling_var = item
+
+                control_enabled = playlist_enabled
+                if controlling_var is not None:
+                    control_enabled = playlist_enabled and bool(controlling_var.get())
+
+                if widget_type == "combo":
+                    widget.configure(state="readonly" if control_enabled else "disabled")
+                else:
+                    widget.configure(state="normal" if control_enabled else "disabled")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def update_playlist_metadata_visibility(*args):
     try:
+        sidecars_enabled = normalize_capture_mode(capture_mode_var.get()) in {"media", "metadata_only"}
+
         if source_scope_var.get() == "include_playlist":
             playlist_metadata_check.grid()
+            playlist_metadata_check.configure(state="normal" if sidecars_enabled else "disabled")
         else:
             save_playlist_metadata_var.set(False)
             playlist_metadata_check.grid_remove()
     except Exception:
         pass
 
+    update_playlist_options_state()
     update_capture_options_summary()
 
 
@@ -9592,6 +11834,7 @@ def toggle_advanced_options_panel():
         return
 
     hide_capture_options_panel(save=True)
+    hide_metadata_options_panel(save=True)
     hide_pacing_options_panel(save=True)
     update_capture_options_summary()
     advanced_options_panel.grid(
@@ -9617,6 +11860,7 @@ def toggle_pacing_options_panel():
         return
 
     hide_capture_options_panel(save=True)
+    hide_metadata_options_panel(save=True)
     hide_advanced_options_panel(save=True)
     update_capture_options_summary()
     pacing_options_panel.grid(
@@ -10362,10 +12606,9 @@ def open_case_browser(select_tab=True, silent=False):
             return {
                 "thumb_w": 120,
                 "thumb_h": 76,
-                "card_w": 150,
-                "wrap": 130,
-                "label_width": 20,
-                "columns": 6,
+                "card_w": 170,
+                "wrap": 150,
+                "label_chars": 22,
                 "font_big": 12,
                 "font_small": 8,
             }
@@ -10374,10 +12617,9 @@ def open_case_browser(select_tab=True, silent=False):
             return {
                 "thumb_w": 220,
                 "thumb_h": 138,
-                "card_w": 260,
-                "wrap": 230,
-                "label_width": 34,
-                "columns": 3,
+                "card_w": 300,
+                "wrap": 280,
+                "label_chars": 42,
                 "font_big": 18,
                 "font_small": 10,
             }
@@ -10385,13 +12627,92 @@ def open_case_browser(select_tab=True, silent=False):
         return {
             "thumb_w": 160,
             "thumb_h": 100,
-            "card_w": 200,
-            "wrap": 170,
-            "label_width": 24,
-            "columns": 4,
+            "card_w": 230,
+            "wrap": 210,
+            "label_chars": 30,
             "font_big": 14,
             "font_small": 9,
         }
+
+    def wrap_case_browser_card_text(value, max_chars):
+        text = str(value or "").strip()
+
+        if not text:
+            return ""
+
+        parts = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                parts.append("")
+                continue
+
+            wrapped = textwrap.wrap(
+                line,
+                width=max(8, int(max_chars)),
+                break_long_words=True,
+                break_on_hyphens=True,
+            )
+            parts.extend(wrapped or [line])
+
+        return "\n".join(parts)
+
+    case_browser_layout_columns = {"value": 0}
+    case_browser_reflow_after_id = {"value": None}
+
+    def get_case_browser_canvas_width():
+        try:
+            width = int(canvas.winfo_width())
+        except Exception:
+            width = 0
+
+        if width <= 1:
+            try:
+                width = int(right_frame.winfo_width()) - 24
+            except Exception:
+                width = 0
+
+        return max(1, width)
+
+    def get_dynamic_browser_columns(geometry=None, canvas_width=None):
+        geometry = geometry or get_browser_icon_geometry()
+        available_width = int(canvas_width or get_case_browser_canvas_width())
+
+        # padx=10 on each side of every card plus a small safety margin avoids
+        # the final card nudging past the right edge and forcing horizontal overflow.
+        card_pitch = max(1, int(geometry["card_w"]) + 24)
+        usable_width = max(1, available_width - 12)
+
+        return max(1, usable_width // card_pitch)
+
+    def schedule_case_browser_reflow_if_needed(event=None):
+        try:
+            geometry = get_browser_icon_geometry()
+            new_columns = get_dynamic_browser_columns(geometry, getattr(event, "width", None))
+        except Exception:
+            return
+
+        if not case_browser_layout_columns["value"] or new_columns == case_browser_layout_columns["value"]:
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
+            return
+
+        try:
+            if case_browser_reflow_after_id["value"]:
+                root.after_cancel(case_browser_reflow_after_id["value"])
+        except Exception:
+            pass
+
+        def do_reflow():
+            case_browser_reflow_after_id["value"] = None
+            try:
+                render_files(get_selected_browser_folder())
+            except Exception:
+                pass
+
+        case_browser_reflow_after_id["value"] = root.after(200, do_reflow)
 
     ttk.Label(right_frame, textvariable=browser_status_var).grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
@@ -10454,8 +12775,16 @@ def open_case_browser(select_tab=True, silent=False):
         canvas.configure(scrollregion=canvas.bbox("all"))
 
     def configure_canvas(event):
-        # Keep the content frame at its natural requested width so horizontal scrolling works.
+        # Keep the file-card surface aligned to the visible pane width. The
+        # column count is recalculated separately, so the content should not
+        # force horizontal scrolling just because the window was narrowed.
+        try:
+            canvas.itemconfigure(content_window, width=max(1, event.width))
+        except Exception:
+            pass
+
         canvas.configure(scrollregion=canvas.bbox("all"))
+        schedule_case_browser_reflow_if_needed(event)
 
     content_frame.bind("<Configure>", configure_content)
     canvas.bind("<Configure>", configure_canvas)
@@ -10715,25 +13044,37 @@ def open_case_browser(select_tab=True, silent=False):
             return
 
         geometry = get_browser_icon_geometry()
-        columns = geometry["columns"]
+        columns = get_dynamic_browser_columns(geometry)
+        case_browser_layout_columns["value"] = columns
         thumb_w = geometry["thumb_w"]
         thumb_h = geometry["thumb_h"]
         wrap = geometry["wrap"]
-        label_width = geometry["label_width"]
+        label_chars = geometry["label_chars"]
+        card_w = geometry["card_w"]
 
         card_entries = {}
         media_paths = []
         index_state = {"index": 0}
+
+        try:
+            for column_index in range(max(1, columns + 1)):
+                content_frame.columnconfigure(column_index, weight=0)
+            for column_index in range(columns):
+                content_frame.columnconfigure(column_index, weight=1, uniform="case_file_cards")
+        except Exception:
+            pass
 
         def create_file_card(index, path):
             row = index // columns
             column = index % columns
 
             card = ttk.Frame(content_frame, padding=10, relief="ridge")
-            card.grid(row=row, column=column, sticky="n", padx=10, pady=10)
+            card.grid(row=row, column=column, sticky="new", padx=10, pady=10)
+            card.columnconfigure(0, weight=1, minsize=card_w)
 
             ext = os.path.splitext(path)[1].lower().lstrip(".")
-            tooltip_text = f"{os.path.basename(path)}\n\nDouble-click to open. Right-click for actions."
+            file_name = os.path.basename(path)
+            tooltip_text = f"{file_name}\n\nDouble-click to open. Right-click for actions."
 
             thumb = make_placeholder(
                 card,
@@ -10745,14 +13086,26 @@ def open_case_browser(select_tab=True, silent=False):
             )
             thumb.grid(row=0, column=0, pady=(0, 6))
 
-            name_label = ttk.Label(card, text=os.path.basename(path), width=label_width, wraplength=wrap, justify="center")
-            name_label.grid(row=1, column=0)
+            name_label = ttk.Label(
+                card,
+                text=wrap_case_browser_card_text(file_name, label_chars),
+                wraplength=wrap,
+                justify="center",
+                anchor="center",
+            )
+            name_label.grid(row=1, column=0, sticky="ew")
 
             info_label = None
             rel_row = 2
             if is_browser_media_file(path):
-                info_label = ttk.Label(card, text="Media info loading...", width=label_width, wraplength=wrap, justify="center")
-                info_label.grid(row=2, column=0)
+                info_label = ttk.Label(
+                    card,
+                    text="Media info loading...",
+                    wraplength=wrap,
+                    justify="center",
+                    anchor="center",
+                )
+                info_label.grid(row=2, column=0, sticky="ew")
                 rel_row = 3
                 media_paths.append(path)
 
@@ -10761,8 +13114,14 @@ def open_case_browser(select_tab=True, silent=False):
             except Exception:
                 rel_path = path
 
-            type_label = ttk.Label(card, text=rel_path, width=label_width, wraplength=wrap, justify="center")
-            type_label.grid(row=rel_row, column=0)
+            type_label = ttk.Label(
+                card,
+                text=wrap_case_browser_card_text(rel_path, label_chars),
+                wraplength=wrap,
+                justify="center",
+                anchor="center",
+            )
+            type_label.grid(row=rel_row, column=0, sticky="ew")
 
             widgets = [card, thumb, name_label, type_label]
             if info_label:
@@ -10814,7 +13173,7 @@ def open_case_browser(select_tab=True, silent=False):
 
             if info_label:
                 info_summary = get_media_info_summary(media_info, path)
-                info_label.configure(text=info_summary["card"])
+                info_label.configure(text=wrap_case_browser_card_text(info_summary["card"], label_chars))
                 tooltip_text = info_summary["tooltip"] + "\n\nDouble-click to open. Right-click for actions."
 
             if thumb_path and os.path.isfile(thumb_path):
@@ -11159,7 +13518,7 @@ def open_case_browser(select_tab=True, silent=False):
     tree.bind("<<TreeviewSelect>>", on_tree_select)
     filter_menu.bind("<<ComboboxSelected>>", lambda event: refresh_browser_view())
     sort_menu.bind("<<ComboboxSelected>>", lambda event: refresh_browser_view())
-    scale_menu.bind("<<ComboboxSelected>>", lambda event: refresh_browser_view())
+    scale_menu.bind("<<ComboboxSelected>>", lambda event: (case_browser_layout_columns.update({"value": 0}), refresh_browser_view()))
 
     ttk.Button(top_bar, text="Refresh", command=refresh_tree).pack(side="right", padx=(6, 0))
     ttk.Button(top_bar, text="Verify Case Files", command=verify_case_files).pack(side="right", padx=(6, 0))
@@ -11186,6 +13545,7 @@ def on_close():
         mark_running_queue_jobs_interrupted("App closed while job was running.")
 
     try:
+        save_url_box_persistence_if_enabled()
         save_settings(show_popup=False)
         save_job_queue_state()
     except Exception:
@@ -11217,8 +13577,8 @@ try:
 except Exception:
     ORIGINAL_TTK_THEME = ""
 root.title(f"{APP_TITLE} - Profile: {DEFAULT_PROFILE_NAME}")
-root.geometry(f"{APP_WINDOW_WIDTH}x{APP_WINDOW_HEIGHT_BASE}")
-root.minsize(APP_WINDOW_MIN_WIDTH, APP_WINDOW_MIN_HEIGHT_BASE)
+root.geometry(f"{APP_WINDOW_WIDTH}x{APP_WINDOW_HEIGHT_WITH_VPN}")
+root.minsize(APP_WINDOW_MIN_WIDTH, APP_WINDOW_MIN_HEIGHT_WITH_VPN)
 
 script_path_var = tk.StringVar(value=DEFAULTS["script_path"])
 yt_dlp_path_var = tk.StringVar(value=DEFAULTS["yt_dlp_path"])
@@ -11249,6 +13609,7 @@ case_browser_sort_var = tk.StringVar(value=APP_SETTINGS_DEFAULTS["case_browser_s
 case_browser_current_only_var = tk.BooleanVar(value=APP_SETTINGS_DEFAULTS["case_browser_current_only"])
 case_browser_icon_scale_var = tk.StringVar(value=APP_SETTINGS_DEFAULTS["case_browser_icon_scale"])
 job_persistence_var = tk.BooleanVar(value=APP_SETTINGS_DEFAULTS["job_persistence"])
+url_box_persistence_var = tk.BooleanVar(value=APP_SETTINGS_DEFAULTS["url_box_persistence"])
 proxy_protocol_var = tk.StringVar(value=APP_SETTINGS_DEFAULTS["proxy_protocol"])
 proxy_address_var = tk.StringVar(value=APP_SETTINGS_DEFAULTS["proxy_address"])
 proxy_port_var = tk.StringVar(value=APP_SETTINGS_DEFAULTS["proxy_port"])
@@ -11259,6 +13620,15 @@ selected_profile_var = tk.StringVar(value=DEFAULT_PROFILE_NAME)
 capture_options_summary_var = tk.StringVar(value="")
 capture_mode_var = tk.StringVar(value=DEFAULTS["capture_mode"])
 source_scope_var = tk.StringVar(value=DEFAULTS["source_scope"])
+playlist_items_enabled_var = tk.BooleanVar(value=DEFAULTS["playlist_items_enabled"])
+playlist_items_var = tk.StringVar(value=DEFAULTS["playlist_items"])
+playlist_order_enabled_var = tk.BooleanVar(value=DEFAULTS["playlist_order_enabled"])
+playlist_order_var = tk.StringVar(value=DEFAULTS["playlist_order"])
+max_playlist_items_enabled_var = tk.BooleanVar(value=DEFAULTS["max_playlist_items_enabled"])
+max_playlist_items_var = tk.StringVar(value=DEFAULTS["max_playlist_items"])
+break_on_existing_var = tk.BooleanVar(value=DEFAULTS["break_on_existing"])
+skip_playlist_after_errors_enabled_var = tk.BooleanVar(value=DEFAULTS["skip_playlist_after_errors_enabled"])
+skip_playlist_after_errors_var = tk.StringVar(value=DEFAULTS["skip_playlist_after_errors"])
 archive_mode_var = tk.StringVar(value=DEFAULTS["archive_mode"])
 max_resolution_var = tk.StringVar(value=DEFAULTS["max_resolution"])
 gui_cache_mode_var = tk.StringVar(value=display_gui_cache_mode(DEFAULTS["gui_cache_mode"]))
@@ -11296,6 +13666,11 @@ write_thumbnail_var = tk.BooleanVar(value=DEFAULTS["write_thumbnail"])
 write_subs_var = tk.BooleanVar(value=DEFAULTS["write_subs"])
 write_auto_subs_var = tk.BooleanVar(value=DEFAULTS["write_auto_subs"])
 write_comments_var = tk.BooleanVar(value=DEFAULTS["write_comments"])
+embed_metadata_var = tk.BooleanVar(value=DEFAULTS["embed_metadata"])
+embed_thumbnail_var = tk.BooleanVar(value=DEFAULTS["embed_thumbnail"])
+embed_subs_var = tk.BooleanVar(value=DEFAULTS["embed_subs"])
+embed_chapters_var = tk.BooleanVar(value=DEFAULTS["embed_chapters"])
+embed_info_json_var = tk.BooleanVar(value=DEFAULTS["embed_info_json"])
 
 
 for option_var in [
@@ -11303,6 +13678,15 @@ for option_var in [
     format_strategy_var,
     capture_mode_var,
     source_scope_var,
+    playlist_items_enabled_var,
+    playlist_items_var,
+    playlist_order_enabled_var,
+    playlist_order_var,
+    max_playlist_items_enabled_var,
+    max_playlist_items_var,
+    break_on_existing_var,
+    skip_playlist_after_errors_enabled_var,
+    skip_playlist_after_errors_var,
     archive_mode_var,
     max_resolution_var,
     save_playlist_metadata_var,
@@ -11337,6 +13721,11 @@ for option_var in [
     write_subs_var,
     write_auto_subs_var,
     write_comments_var,
+    embed_metadata_var,
+    embed_thumbnail_var,
+    embed_subs_var,
+    embed_chapters_var,
+    embed_info_json_var,
 ]:
     option_var.trace_add("write", update_capture_options_summary)
 
@@ -11348,16 +13737,36 @@ app_notebook.pack(fill="both", expand=True)
 
 main = ttk.Frame(app_notebook, padding=12)
 job_queue_tab = ttk.Frame(app_notebook, padding=0)
+playlist_preview_tab = ttk.Frame(app_notebook, padding=0)
 case_browser_tab = ttk.Frame(app_notebook, padding=0)
 
 app_notebook.add(main, text="Capture")
 app_notebook.add(job_queue_tab, text="Job Queue")
+app_notebook.add(playlist_preview_tab, text="Playlist Preview")
 app_notebook.add(case_browser_tab, text="Case Browser")
 
 job_queue_tab.columnconfigure(0, weight=1)
 job_queue_tab.rowconfigure(0, weight=0)
 job_queue_tab.rowconfigure(1, weight=1)
 job_queue_tab.rowconfigure(2, weight=0)
+
+playlist_preview_tab.columnconfigure(0, weight=1)
+playlist_preview_tab.rowconfigure(0, weight=1)
+
+playlist_preview_placeholder = ttk.Frame(playlist_preview_tab, padding=16)
+playlist_preview_placeholder.grid(row=0, column=0, sticky="nsew")
+playlist_preview_placeholder.columnconfigure(0, weight=1)
+playlist_preview_placeholder.rowconfigure(0, weight=1)
+
+playlist_preview_placeholder_content = ttk.Frame(playlist_preview_placeholder)
+playlist_preview_placeholder_content.grid(row=0, column=0)
+
+ttk.Label(
+    playlist_preview_placeholder_content,
+    text="Playlist Preview will automatically load current URL box or selected Input File contents when this tab is selected.",
+    anchor="center",
+    justify="center",
+).pack()
 
 case_browser_tab.columnconfigure(0, weight=1)
 case_browser_tab.rowconfigure(0, weight=1)
@@ -11373,10 +13782,12 @@ ttk.Label(
     anchor="center",
 ).grid(row=0, column=0, sticky="ew")
 
+app_notebook.bind("<<NotebookTabChanged>>", on_notebook_tab_changed)
+
 main.columnconfigure(1, weight=1)
 main.columnconfigure(3, weight=0)
-main.rowconfigure(10, weight=1, minsize=URL_ROW_MIN_HEIGHT)
-main.rowconfigure(15, weight=2)
+main.rowconfigure(10, weight=0, minsize=URL_ROW_MIN_HEIGHT)
+main.rowconfigure(15, weight=1)
 
 
 def add_file_row(row, label, var):
@@ -11429,6 +13840,8 @@ cookies_menu.add_command(label="Decrypt Cookies from Storage", command=decrypt_c
 tools_menu = tk.Menu(menu_bar, tearoff=0)
 menu_bar.add_cascade(label="Tools", menu=tools_menu)
 tools_menu.add_command(label="Proxy Options", command=open_proxy_options_dialog)
+tools_menu.add_command(label="Open Playlist Preview Tab", command=open_playlist_preview_dialog)
+tools_menu.add_command(label="Update Deno", command=update_deno_direct)
 tools_menu.add_command(label="Domain Presets", command=open_domain_presets_window)
 profile_menu = tk.Menu(menu_bar, tearoff=0)
 menu_bar.add_cascade(label="Profile", menu=profile_menu)
@@ -11460,6 +13873,11 @@ settings_menu.add_checkbutton(
     label="Job Persistence",
     variable=job_persistence_var,
     command=toggle_job_persistence_setting,
+)
+settings_menu.add_checkbutton(
+    label="URL Box Persistence",
+    variable=url_box_persistence_var,
+    command=toggle_url_box_persistence_setting,
 )
 settings_menu.add_separator()
 settings_menu.add_command(label="Reset Defaults", command=reset_defaults)
@@ -11543,6 +13961,7 @@ case_name_tag_items = [
     "%utcdatetime%",
     "%domains%",
     "%presets%",
+    "%playlist%",
     "%year%",
     "%month%",
     "%day%",
@@ -11592,7 +14011,7 @@ add_folder_row(6, "FFmpeg Folder", ffmpeg_folder_var)
 
 options_frame = ttk.Frame(main)
 options_frame.grid(row=7, column=0, columnspan=4, sticky="ew", padx=0, pady=5)
-options_frame.columnconfigure(3, weight=1)
+options_frame.columnconfigure(4, weight=1)
 
 capture_options_button = ttk.Button(
     options_frame,
@@ -11601,31 +14020,46 @@ capture_options_button = ttk.Button(
 )
 capture_options_button.grid(row=0, column=0, sticky="w", padx=(0, 8))
 
-advanced_options_button = ttk.Button(
+metadata_options_button = ttk.Button(
     options_frame,
-    text="Advanced Options ▾",
-    command=toggle_advanced_options_panel,
+    text="Metadata Options ▾",
+    command=toggle_metadata_options_panel,
 )
-advanced_options_button.grid(row=0, column=1, sticky="w", padx=(0, 8))
+metadata_options_button.grid(row=0, column=1, sticky="w", padx=(0, 8))
 
 pacing_options_button = ttk.Button(
     options_frame,
     text="Pacing Options ▾",
     command=toggle_pacing_options_panel,
 )
-pacing_options_button.grid(row=0, column=2, sticky="w", padx=(0, 10))
+pacing_options_button.grid(row=0, column=2, sticky="w", padx=(0, 8))
+
+advanced_options_button = ttk.Button(
+    options_frame,
+    text="Advanced Options ▾",
+    command=toggle_advanced_options_panel,
+)
+advanced_options_button.grid(row=0, column=3, sticky="w", padx=(0, 10))
 
 capture_options_summary_label = ttk.Label(
     options_frame,
     textvariable=capture_options_summary_var,
-    wraplength=760,
+    wraplength=700,
     justify="left",
 )
-capture_options_summary_label.grid(row=0, column=3, sticky="ew")
+capture_options_summary_label.grid(row=0, column=4, sticky="ew")
 
 def update_capture_options_summary_wrap(event=None):
     try:
-        width = max(420, options_frame.winfo_width() - capture_options_button.winfo_width() - advanced_options_button.winfo_width() - pacing_options_button.winfo_width() - 64)
+        width = max(
+            360,
+            options_frame.winfo_width()
+            - capture_options_button.winfo_width()
+            - metadata_options_button.winfo_width()
+            - pacing_options_button.winfo_width()
+            - advanced_options_button.winfo_width()
+            - 78,
+        )
         capture_options_summary_label.configure(wraplength=width)
     except Exception:
         pass
@@ -11677,6 +14111,8 @@ ttk.Label(
 
 urls_text = scrolledtext.ScrolledText(main, height=8, wrap="word")
 urls_text.grid(row=10, column=0, columnspan=3, sticky="nsew", pady=(0, 8))
+urls_text.bind("<<Modified>>", handle_playlist_preview_source_changed)
+urls_text.edit_modified(False)
 
 url_button_frame = ttk.Frame(main)
 url_button_frame.grid(row=10, column=3, sticky="n", padx=(8, 0), pady=(0, 8))
@@ -11827,6 +14263,10 @@ ttk.Label(main, text="Output Log").grid(row=13, column=0, columnspan=4, sticky="
 log_box = scrolledtext.ScrolledText(main, height=14, wrap="word")
 log_box.grid(row=15, column=0, columnspan=4, sticky="nsew")
 
+if FRESH_STARTUP_MESSAGES:
+    log_box.insert("end", "\n".join(FRESH_STARTUP_MESSAGES) + "\n")
+    log_box.see("end")
+
 capture_options_panel = ttk.LabelFrame(main, text="Capture Options", padding=12)
 capture_options_panel.columnconfigure(0, weight=1)
 capture_options_panel.columnconfigure(1, weight=1)
@@ -11844,14 +14284,21 @@ mode_frame = ttk.LabelFrame(capture_options_panel, text="Capture Mode", padding=
 mode_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
 ttk.Radiobutton(
     mode_frame,
-    text="Download media and selected artifacts",
+    text="Download media and selected sidecars",
     variable=capture_mode_var,
     value="media",
     command=update_capture_options_summary,
 ).pack(anchor="w", pady=2)
 ttk.Radiobutton(
     mode_frame,
-    text="Media only; ignore requested artifacts",
+    text="Media + embedded metadata; ignore sidecars",
+    variable=capture_mode_var,
+    value="media_embedded",
+    command=update_capture_options_summary,
+).pack(anchor="w", pady=2)
+ttk.Radiobutton(
+    mode_frame,
+    text="Media only; ignore metadata options",
     variable=capture_mode_var,
     value="media_only",
     command=update_capture_options_summary,
@@ -11942,8 +14389,91 @@ ttk.Radiobutton(
 date_outer_frame = ttk.LabelFrame(capture_options_panel, text="Date Filters", padding=8)
 date_outer_frame.grid(row=2, column=1, columnspan=2, sticky="nsew", padx=8, pady=(0, 8))
 
+playlist_frame = ttk.LabelFrame(capture_options_panel, text="Playlist Options", padding=8)
+playlist_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+playlist_frame.columnconfigure(1, weight=1)
+playlist_frame.columnconfigure(3, weight=0)
+playlist_frame.columnconfigure(5, weight=0)
+
+playlist_option_widgets = []
+
+playlist_items_check = ttk.Checkbutton(
+    playlist_frame,
+    text="Items",
+    variable=playlist_items_enabled_var,
+    command=update_capture_options_summary,
+)
+playlist_items_check.grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+playlist_option_widgets.append((playlist_items_check, "check", None))
+
+playlist_items_entry = ttk.Entry(playlist_frame, textvariable=playlist_items_var, width=28)
+playlist_items_entry.grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=3)
+playlist_option_widgets.append((playlist_items_entry, "entry", playlist_items_enabled_var))
+
+playlist_order_check = ttk.Checkbutton(
+    playlist_frame,
+    text="Order",
+    variable=playlist_order_enabled_var,
+    command=update_capture_options_summary,
+)
+playlist_order_check.grid(row=0, column=2, sticky="w", padx=(0, 8), pady=3)
+playlist_option_widgets.append((playlist_order_check, "check", None))
+
+playlist_order_menu = ttk.Combobox(
+    playlist_frame,
+    textvariable=playlist_order_var,
+    values=["normal", "reverse", "random"],
+    state="readonly",
+    width=10,
+)
+playlist_order_menu.grid(row=0, column=3, sticky="w", padx=(0, 12), pady=3)
+playlist_order_menu.bind("<<ComboboxSelected>>", lambda event: update_capture_options_summary())
+playlist_option_widgets.append((playlist_order_menu, "combo", playlist_order_enabled_var))
+
+max_playlist_items_check = ttk.Checkbutton(
+    playlist_frame,
+    text="Max items",
+    variable=max_playlist_items_enabled_var,
+    command=update_capture_options_summary,
+)
+max_playlist_items_check.grid(row=0, column=4, sticky="w", padx=(0, 8), pady=3)
+playlist_option_widgets.append((max_playlist_items_check, "check", None))
+
+max_playlist_items_entry = ttk.Entry(playlist_frame, textvariable=max_playlist_items_var, width=8)
+max_playlist_items_entry.grid(row=0, column=5, sticky="w", pady=3)
+playlist_option_widgets.append((max_playlist_items_entry, "entry", max_playlist_items_enabled_var))
+
+break_on_existing_check = ttk.Checkbutton(
+    playlist_frame,
+    text="Stop when archived item is found",
+    variable=break_on_existing_var,
+    command=update_capture_options_summary,
+)
+break_on_existing_check.grid(row=1, column=0, columnspan=2, sticky="w", pady=3)
+playlist_option_widgets.append((break_on_existing_check, "check", None))
+
+skip_playlist_after_errors_check = ttk.Checkbutton(
+    playlist_frame,
+    text="Skip after failed items",
+    variable=skip_playlist_after_errors_enabled_var,
+    command=update_capture_options_summary,
+)
+skip_playlist_after_errors_check.grid(row=1, column=2, sticky="w", padx=(0, 8), pady=3)
+playlist_option_widgets.append((skip_playlist_after_errors_check, "check", None))
+
+skip_playlist_after_errors_entry = ttk.Entry(playlist_frame, textvariable=skip_playlist_after_errors_var, width=8)
+skip_playlist_after_errors_entry.grid(row=1, column=3, sticky="w", padx=(0, 12), pady=3)
+playlist_option_widgets.append((skip_playlist_after_errors_entry, "entry", skip_playlist_after_errors_enabled_var))
+
+ttk.Label(
+    playlist_frame,
+    text="Enabled only for playlist/multi-item sources. Check an option to pass that playlist flag. Saved values are preserved when unchecked.",
+    wraplength=900,
+    justify="left",
+).grid(row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
+
 output_record_frame = ttk.LabelFrame(capture_options_panel, text="Output Records", padding=8)
-output_record_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+output_record_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 output_record_frame.columnconfigure(1, weight=1)
 output_record_frame.columnconfigure(3, weight=1)
 
@@ -12066,10 +14596,35 @@ ttk.Label(
 ).grid(row=2, column=1, columnspan=5, sticky="w", padx=2, pady=(2, 0))
 
 update_date_filter_states()
+update_playlist_options_state()
 
 
-artifact_frame = ttk.LabelFrame(capture_options_panel, text="Sidecar Artifacts", padding=8)
-artifact_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+capture_button_frame = ttk.Frame(capture_options_panel)
+capture_button_frame.grid(row=5, column=0, columnspan=3, sticky="ne", pady=(8, 0))
+
+ttk.Button(
+    capture_button_frame,
+    text="Close Capture Options",
+    command=close_capture_options_panel,
+).pack(side="left", padx=6)
+
+capture_options_panel.grid_remove()
+
+metadata_options_panel = ttk.LabelFrame(main, text="Metadata Options", padding=12)
+metadata_options_panel.columnconfigure(0, weight=1)
+metadata_options_panel.columnconfigure(1, weight=1)
+metadata_options_panel.columnconfigure(2, weight=1)
+metadata_options_panel.rowconfigure(4, weight=1)
+
+ttk.Label(
+    metadata_options_panel,
+    text="Sidecar options create separate files. Embed options modify the final media container and apply in Media + sidecars or Media + Embedded mode.",
+    wraplength=980,
+    justify="left",
+).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+
+artifact_frame = ttk.LabelFrame(metadata_options_panel, text="Sidecar Artifacts", padding=8)
+artifact_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 artifact_frame.columnconfigure(0, weight=1)
 artifact_frame.columnconfigure(1, weight=1)
 artifact_frame.columnconfigure(2, weight=1)
@@ -12085,13 +14640,17 @@ artifact_options = [
     ("Save comments when supported", write_comments_var, 1, 2),
 ]
 
+sidecar_option_widgets = []
+
 for label_text, variable, row_index, column_index in artifact_options:
-    ttk.Checkbutton(
+    widget = ttk.Checkbutton(
         artifact_frame,
         text=label_text,
         variable=variable,
         command=update_capture_options_summary,
-    ).grid(row=row_index, column=column_index, sticky="w", padx=4, pady=3)
+    )
+    widget.grid(row=row_index, column=column_index, sticky="w", padx=4, pady=3)
+    sidecar_option_widgets.append(widget)
 
 playlist_metadata_check = ttk.Checkbutton(
     artifact_frame,
@@ -12103,23 +14662,56 @@ playlist_metadata_check.grid(row=1, column=3, sticky="w", padx=4, pady=3)
 
 ttk.Label(
     artifact_frame,
-    text="Note: comments, subtitles, thumbnails, date filtering, and metadata availability depend on the source and yt-dlp extractor support.",
+    text="Sidecar files remain separate from the final media file and are easier to inspect, hash, compare, and preserve independently.",
     wraplength=900,
     justify="left",
 ).grid(row=2, column=0, columnspan=4, sticky="ew", padx=4, pady=(6, 0))
 
-update_playlist_metadata_visibility()
+embed_frame = ttk.LabelFrame(metadata_options_panel, text="Embed Options", padding=8)
+embed_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+embed_frame.columnconfigure(0, weight=1)
+embed_frame.columnconfigure(1, weight=1)
+embed_frame.columnconfigure(2, weight=1)
 
-capture_button_frame = ttk.Frame(capture_options_panel)
-capture_button_frame.grid(row=5, column=0, columnspan=3, sticky="e", pady=(8, 0))
+embed_option_widgets = []
+
+embed_options = [
+    ("Embed metadata into media file", embed_metadata_var, 0, 0),
+    ("Embed thumbnail as cover art", embed_thumbnail_var, 0, 1),
+    ("Embed subtitles into media file", embed_subs_var, 0, 2),
+    ("Embed chapter markers", embed_chapters_var, 1, 0),
+    ("Embed info JSON into MKV/MKA", embed_info_json_var, 1, 1),
+]
+
+for label_text, variable, row_index, column_index in embed_options:
+    widget = ttk.Checkbutton(
+        embed_frame,
+        text=label_text,
+        variable=variable,
+        command=update_capture_options_summary,
+    )
+    widget.grid(row=row_index, column=column_index, sticky="w", padx=4, pady=3)
+    embed_option_widgets.append(widget)
+
+ttk.Label(
+    embed_frame,
+    text="Embedding applies in Media + sidecars or Media + Embedded mode. Media + Embedded ignores sidecar files. Some embed options depend on output format, available metadata, and FFmpeg/mutagen support.",
+    wraplength=900,
+    justify="left",
+).grid(row=2, column=0, columnspan=3, sticky="ew", padx=4, pady=(6, 0))
+
+metadata_button_frame = ttk.Frame(metadata_options_panel)
+metadata_button_frame.grid(row=4, column=0, columnspan=3, sticky="ne", pady=(8, 0))
 
 ttk.Button(
-    capture_button_frame,
-    text="Close Capture Options",
-    command=close_capture_options_panel,
+    metadata_button_frame,
+    text="Close Metadata Options",
+    command=close_metadata_options_panel,
 ).pack(side="left", padx=6)
 
-capture_options_panel.grid_remove()
+metadata_options_panel.grid_remove()
+update_playlist_metadata_visibility()
+update_metadata_options_state()
 
 advanced_options_panel = ttk.LabelFrame(main, text="Advanced Options", padding=12)
 advanced_options_panel.columnconfigure(0, weight=1)
@@ -12411,6 +15003,7 @@ ttk.Button(
 pacing_options_panel.grid_remove()
 
 case_name_var.trace_add("write", update_case_folder_preview)
+input_file_var.trace_add("write", handle_input_file_var_changed)
 output_root_var.trace_add("write", on_output_root_changed)
 update_case_folder_preview()
 
@@ -12434,8 +15027,10 @@ def deferred_job_queue_startup():
     refresh_job_queue_window()
 
 load_settings(show_popup=False, startup=True)
+initialize_url_box_from_persistence_and_input_files()
 start_case_browser_result_poller()
 schedule_case_browser_autoload(delay_ms=400)
+schedule_playlist_preview_autoload(delay_ms=500)
 apply_app_theme()
 update_window_title()
 if check_vpn_var.get():

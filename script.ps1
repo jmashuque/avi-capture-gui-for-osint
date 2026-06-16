@@ -35,6 +35,23 @@ param(
 
     [switch]$IncludePlaylist,
 
+    [Parameter(Mandatory = $false)]
+    [string]$PlaylistItems,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("Normal", "Reverse", "Random")]
+    [string]$PlaylistOrder = "Normal",
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 1000000)]
+    [int]$MaxPlaylistItems = 0,
+
+    [switch]$BreakOnExisting,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 1000000)]
+    [int]$SkipPlaylistAfterErrors = 0,
+
     [switch]$WriteInfoJson,
 
     [switch]$WriteSourceLink,
@@ -48,6 +65,16 @@ param(
     [switch]$WriteAutoSubs,
 
     [switch]$WriteComments,
+
+    [switch]$EmbedMetadata,
+
+    [switch]$EmbedThumbnail,
+
+    [switch]$EmbedSubs,
+
+    [switch]$EmbedChapters,
+
+    [switch]$EmbedInfoJson,
 
     [Parameter(Mandatory = $false)]
     [ValidateSet("Use", "Ignore", "Force")]
@@ -116,6 +143,33 @@ $ErrorActionPreference = "Stop"
 
 if ($MetadataOnly -and $MediaOnly) {
     throw "MetadataOnly and MediaOnly cannot both be enabled."
+}
+
+$EmbedRequested = $EmbedMetadata -or $EmbedThumbnail -or $EmbedSubs -or $EmbedChapters -or $EmbedInfoJson
+
+if ($EmbedRequested -and ($MetadataOnly -or $MediaOnly)) {
+    throw "Embed options require a media capture mode. They cannot be used with MetadataOnly or MediaOnly."
+}
+
+$PlaylistItemsClean = ""
+if (-not [string]::IsNullOrWhiteSpace($PlaylistItems)) {
+    $PlaylistItemsClean = ($PlaylistItems -replace '\s+', '')
+
+    if ($PlaylistItemsClean -notmatch '^[0-9,:\-]+$') {
+        throw "PlaylistItems is invalid. Use indexes or ranges such as 1:10,30,35:40."
+    }
+}
+
+$PlaylistOptionsRequested = (
+    -not [string]::IsNullOrWhiteSpace($PlaylistItemsClean) -or
+    $PlaylistOrder -ne "Normal" -or
+    $MaxPlaylistItems -gt 0 -or
+    $BreakOnExisting -or
+    $SkipPlaylistAfterErrors -gt 0
+)
+
+if ($PlaylistOptionsRequested -and -not $IncludePlaylist) {
+    throw "Playlist options require IncludePlaylist."
 }
 
 if ($MetadataOnly -and $FormatStrategy -eq "AudioOnly") {
@@ -711,6 +765,11 @@ $OptionLines = @(
     "Metadata only:          $MetadataOnly",
     "Media only:             $MediaOnly",
     "Include playlist:       $IncludePlaylist",
+    "Playlist items:         $PlaylistItemsClean",
+    "Playlist order:         $PlaylistOrder",
+    "Max playlist items:     $MaxPlaylistItems",
+    "Break on existing:      $BreakOnExisting",
+    "Skip playlist errors:   $SkipPlaylistAfterErrors",
     "Write metadata JSON:    $WriteInfoJson",
     "Write source link:      $WriteSourceLink",
     "Write description:      $WriteDescription",
@@ -718,6 +777,11 @@ $OptionLines = @(
     "Write subtitles:        $WriteSubs",
     "Write auto subtitles:   $WriteAutoSubs",
     "Write comments:         $WriteComments",
+    "Embed metadata:         $EmbedMetadata",
+    "Embed thumbnail:        $EmbedThumbnail",
+    "Embed subtitles:        $EmbedSubs",
+    "Embed chapters:         $EmbedChapters",
+    "Embed info JSON:        $EmbedInfoJson",
     "Archive mode:           $ArchiveMode",
     "Date after:             $DateAfterClean",
     "Date before:            $DateBeforeClean",
@@ -790,10 +854,6 @@ $CommonArgs = @(
     "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "--add-header", "Accept-Language: en-US,en;q=0.9",
 
-    "--no-embed-metadata",
-    "--no-embed-thumbnail",
-    "--no-embed-subs",
-
     "--retries", $RetryCount,
     "--fragment-retries", $FragmentRetryCount,
     "--retry-sleep", $RetrySleep,
@@ -836,6 +896,37 @@ switch ($ArchiveMode) {
 
 if (-not $IncludePlaylist) {
     $CommonArgs += "--no-playlist"
+}
+else {
+    if ($PlaylistItemsClean) {
+        $CommonArgs += @("--playlist-items", $PlaylistItemsClean)
+    }
+
+    switch ($PlaylistOrder) {
+        "Reverse" {
+            $CommonArgs += "--playlist-reverse"
+        }
+        "Random" {
+            $CommonArgs += "--playlist-random"
+        }
+    }
+
+    if ($MaxPlaylistItems -gt 0) {
+        $CommonArgs += @("--max-downloads", "$MaxPlaylistItems")
+    }
+
+    if ($BreakOnExisting) {
+        if ($ArchiveMode -eq "Use") {
+            $CommonArgs += "--break-on-existing"
+        }
+        else {
+            Write-RunWarning "Break on existing was requested but Archive Mode is not Use. The option was not passed because it requires the case download archive."
+        }
+    }
+
+    if ($SkipPlaylistAfterErrors -gt 0) {
+        $CommonArgs += @("--skip-playlist-after-errors", "$SkipPlaylistAfterErrors")
+    }
 }
 
 if ($MetadataOnly) {
@@ -900,6 +991,52 @@ if (-not $MediaOnly) {
     if ($GenerateUrlShortcuts) {
         $CommonArgs += "--write-url-link"
     }
+}
+
+if ($EmbedRequested) {
+    if ($EmbedMetadata) {
+        $CommonArgs += "--embed-metadata"
+    }
+    else {
+        $CommonArgs += "--no-embed-metadata"
+    }
+
+    if ($EmbedThumbnail) {
+        $CommonArgs += "--embed-thumbnail"
+    }
+    else {
+        $CommonArgs += "--no-embed-thumbnail"
+    }
+
+    if ($EmbedSubs) {
+        $CommonArgs += "--embed-subs"
+    }
+    else {
+        $CommonArgs += "--no-embed-subs"
+    }
+
+    if ($EmbedChapters) {
+        $CommonArgs += "--embed-chapters"
+    }
+    else {
+        $CommonArgs += "--no-embed-chapters"
+    }
+
+    if ($EmbedInfoJson) {
+        $CommonArgs += "--embed-info-json"
+    }
+    else {
+        $CommonArgs += "--no-embed-info-json"
+    }
+}
+else {
+    $CommonArgs += @(
+        "--no-embed-metadata",
+        "--no-embed-thumbnail",
+        "--no-embed-subs",
+        "--no-embed-chapters",
+        "--no-embed-info-json"
+    )
 }
 
 $EffectiveFormatStrategy = $FormatStrategy
