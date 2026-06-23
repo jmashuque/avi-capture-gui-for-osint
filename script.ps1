@@ -554,7 +554,7 @@ function New-MediaInfoForRecentCaptures {
     return $allOk
 }
 
-function Normalize-YtDlpDate {
+function ConvertTo-YtDlpDate {
     param(
         [string]$Value,
         [string]$Name
@@ -948,8 +948,8 @@ function Write-UniversalArchiveSkipSummary {
 $FFmpegForThumbnails = Resolve-FFmpegForThumbnail -Folder $FFmpegFolder
 $FFprobeForMediaInfo = Resolve-FFprobeForMediaInfo -Folder $FFmpegFolder
 
-$DateAfterClean = Normalize-YtDlpDate -Value $DateAfter -Name "DateAfter"
-$DateBeforeClean = Normalize-YtDlpDate -Value $DateBefore -Name "DateBefore"
+$DateAfterClean = ConvertTo-YtDlpDate -Value $DateAfter -Name "DateAfter"
+$DateBeforeClean = ConvertTo-YtDlpDate -Value $DateBefore -Name "DateBefore"
 
 if ($DateAfterClean -and $DateBeforeClean -and $DateAfterClean -gt $DateBeforeClean) {
     throw "DateAfter cannot be later than DateBefore."

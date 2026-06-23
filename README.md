@@ -180,6 +180,7 @@ Notes:
 - Check VPN is disabled by default.
 - If the URL box is empty, valid Input File(s) can silently populate it.
 - If URL Box Persistence is enabled, saved URL box text loads first on startup.
+- Existing-case warnings only appear when the resolved case folder contains meaningful non-cache files; preview-only `.gui-cache` folders are ignored.
 
 ### Job Queue Tab
 
@@ -203,7 +204,7 @@ Typical flow:
 1. Let the tab load URLs from the current URL box or selected Input File(s).
 2. Use the **Preview** checkmarks to choose which URLs should be queried by **Preview Checked**.
 3. Use the **Include** checkmarks to choose which rows should be used by **Start Included** or **Queue Included**.
-4. Use **Preview All**, **Start All**, or **Queue All** when every top-level URL row should be acted on regardless of checkmarks.
+4. Use **Preview All**, **Start All**, or **Queue All** when every top-level URL row should be acted on regardless of checkmarks. When the URL filter contains text, these buttons change to **Preview Visible**, **Start Visible**, and **Queue Visible** and act only on currently visible rows.
 5. Select a previewed regular URL to review its thumbnail and metadata.
 6. Select a playlist/context URL to review its thumbnail/metadata and its available item rows. Once playlist/context data is confirmed, top-level Start/Queue actions use those item URLs instead of only the source playlist URL.
 7. Right-click a highlighted URL row to preview, start, queue, open, copy, or export only that highlighted row.
@@ -305,23 +306,23 @@ URL Preview uses a top-level URL list and a context-sensitive lower panel. The t
 
 - **Preview** controls which rows are queried by **Preview Checked**.
 - **Include** controls which rows are used by **Start Included** and **Queue Included**.
-- **All** actions act on all usable top-level rows regardless of checkmark state.
+- **All** actions act on all usable top-level rows regardless of checkmark state. When the top URL filter contains text, these buttons change from **All** to **Visible** and act only on rows currently shown by the filter. Clearing the filter restores the whole list and the original **All** labels.
 
-Top-level actions include **Preview All**, **Preview Checked**, **Start All**, **Start Included**, **Queue All**, **Queue Included**, **Stop**, and **Export JSON**. Right-click a highlighted row to preview, start, queue, open, copy, or export only that row.
+Top-level actions include **Preview All** / **Preview Visible**, **Preview Checked**, **Start All** / **Start Visible**, **Start Included**, **Queue All** / **Queue Visible**, **Queue Included**, **Stop**, and **Export JSON**. Right-click a highlighted row to preview, start, queue, open, copy, or export only that row.
 
 When a previewed playlist/channel/context row has extracted item URLs, Start and Queue actions use those item URLs instead of only the source playlist URL. Top-level queue actions create one job per top-level row. Playlist/context item actions group included item URLs into one playlist-tagged job.
 
-The lower **Selected URL Context** area changes based on selection:
+The top URL list has a text filter that searches visible row fields such as status, type, title, uploader, thumbnail status, and URL. The filter count shows how many URL rows are currently shown out of the loaded total. The lower **Selected URL Context** area changes based on selection:
 
 - regular URLs show **Thumbnail** and **Metadata** tabs
 - playlist/channel/context rows show those tabs plus a playlist/context item list
 - selecting a playlist/context item updates the Thumbnail and Metadata tabs for that item
 
-Playlist/context item actions include **Start All Items**, **Start Included Items**, **Queue All Items**, **Queue Included Items**, **Copy Included URLs**, **Load Included URLs**, **Append Included URLs**, **Set Playlist Items**, **Include All**, and **Exclude All**. Included item actions use the item **Include** checkmarks; right-click a highlighted item for single-item actions.
+The playlist/context item list also has a text filter for its visible item fields and shows how many item rows are currently shown out of the loaded total. Playlist/context item actions include **Start All Items** / **Start Visible Items**, **Start Included Items**, **Queue All Items** / **Queue Visible Items**, **Queue Included Items**, **Copy Included URLs**, **Load Included URLs**, **Append Included URLs**, **Set Playlist Items**, **Include All**, and **Exclude All**. The All/Visible item actions ignore item checkmarks; Included item actions use the item **Include** checkmarks. Clearing the item filter restores the whole item list and the original **All Items** labels. Right-click a highlighted item for single-item actions.
 
 **Load Included URLs** replaces the URL box with individual included playlist/context item URLs. **Append Included URLs** appends them to the existing URL box. **Set Playlist Items** keeps the original playlist workflow and writes included item indexes into Capture tab playlist item filtering.
 
-The collapsible **Preview Options** panel opens from the bottom-left of the URL Preview tab. It includes preview pacing, thumbnail mode, thumbnail rate limiting, cache mode, playlist mode, max items, and timeout seconds.
+The collapsible **Preview Options** panel opens from the bottom-left of the URL Preview tab. It includes preview pacing, thumbnail mode, thumbnail rate limiting, cache mode, playlist mode, max items, timeout seconds, and a cache-only **Clear URL Preview Cache** action.
 
 Preview pacing adds delay and jitter between preview metadata requests. The app warns before querying more than 10 preview URLs and stops when output suggests rate limiting, bot challenges, or temporary blocking.
 
@@ -330,19 +331,20 @@ Thumbnail fetching is best-effort and may fail even when the media URL is valid.
 URL Preview cache has two modes:
 
 - **Temporary**: stores preview cache under the resolved case folder. If the final case folder is not known yet, temporary files are staged under `<OutputRoot>\.gui-cache` and cleared after they are copied into the resolved case cache.
-- **Reuse cached thumbnails**: stores reusable thumbnail cache under `<OutputRoot>\.gui-cache\url-preview-persistent`. This cache is outside case files and is cleared by `--fresh`.
+- **Reuse cached thumbnails**: stores reusable thumbnail cache under `<OutputRoot>\.gui-cache\url-preview-persistent`. This cache is outside case files and is cleared by `--fresh` or **Clear URL Preview Cache**.
 
 URL Preview metadata depends on yt-dlp extractor behavior. Fast playlist scans may provide limited per-item metadata, while deep metadata mode can be slower and make more source requests.
 
 ### Case Browser Tab: Review and Verification
 
-The Case Browser loads the selected Output Root in the background. Case-level `.gui-cache` folders are rebuildable GUI cache, not case evidence; they are hidden from Case Browser listings and excluded from verification/manifests. Folders that only contain GUI cache, such as preview-only folders with `manifests\.gui-cache`, are not shown as cases. Output Root `.gui-cache` is temporary and cleared by `--fresh`.
+The Case Browser loads the selected Output Root in the background. Its status line shows how many files are currently displayed after the active file-type filter and text search. Case-level `.gui-cache` folders are rebuildable GUI cache, not case evidence; they are hidden from Case Browser listings and excluded from verification/manifests. Folders that only contain GUI cache, such as preview-only folders with `manifests\.gui-cache`, are not shown as cases. Output Root `.gui-cache` is temporary and cleared by `--fresh`.
 
 It supports:
 
 - folder tree navigation
 - current-folder-only view
 - file-type filters
+- text search across loaded file names, relative paths, file types, and inferred domain fields
 - sorting by name, domain, type, size, newest, or oldest
 - dynamic file-card columns
 - icon scale options
@@ -420,6 +422,13 @@ The app does not automate website logins or collect credentials.
 - The app is not a replacement for authorization, evidence-handling policy, or analyst judgment.
 
 ## Changelog
+
+### v0.2026.0623 - URL Preview Filters and Case Browser Polish
+
+- Added in-memory filters for URL Preview URL rows, playlist/context item rows, and Case Browser file cards, with visible-row counts and clearer empty-state/status messages.
+- Added context-sensitive URL Preview actions that switch from **All** to **Visible** when filters are active and apply only to currently visible rows.
+- Improved case-folder handling so cache-only preview folders do not appear as captured cases or trigger existing-case warnings.
+- Added a URL Preview cache-clearing action for temporary and reusable preview caches.
 
 ### v0.2026.0621 - URL Preview, Universal Archive, and Cache Handling
 

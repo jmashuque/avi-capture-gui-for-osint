@@ -28,7 +28,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 
 APP_TITLE = "yt-dlp GUI for OSINT"
-APP_VERSION = "v0.2026.0621"
+APP_VERSION = "v0.2026.0623"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/ytdlp-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
 APP_WINDOW_HEIGHT_BASE = 950
@@ -1061,12 +1061,21 @@ def get_current_case_folder(now=None, domains=None, presets=None):
 
 
 def case_folder_is_populated(case_folder):
+    """Return True only when a case folder contains meaningful non-cache content."""
+
     if not os.path.isdir(case_folder):
         return False
 
+    ignored_dirs = {".gui-cache", "__pycache__"}
+    ignored_files = {".ds_store", "desktop.ini", "thumbs.db"}
+
     try:
-        with os.scandir(case_folder) as entries:
-            for entry in entries:
+        for root_dir, dir_names, file_names in os.walk(case_folder):
+            dir_names[:] = [name for name in dir_names if name.lower() not in ignored_dirs]
+
+            for file_name in file_names:
+                if file_name.lower() in ignored_files:
+                    continue
                 return True
     except Exception:
         return False
@@ -1090,7 +1099,7 @@ def update_case_folder_preview(*args):
         case_folder = os.path.join(output_root, resolved_name)
 
         if case_folder_is_populated(case_folder):
-            case_folder_preview_var.set(f"Resolved case folder: {case_folder}  [existing populated folder]")
+            case_folder_preview_var.set(f"Resolved case folder: {case_folder}  [existing case files]")
         elif os.path.isdir(case_folder):
             case_folder_preview_var.set(f"Resolved case folder: {case_folder}  [folder exists]")
         else:
@@ -9674,6 +9683,10 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     ))
     context_title_var = tk.StringVar(value="Select a URL row to view details.")
     thumbnail_status_var = tk.StringVar(value="")
+    url_filter_var = tk.StringVar(value="")
+    entry_filter_var = tk.StringVar(value="")
+    url_count_var = tk.StringVar(value="URLs: 0 shown / 0 total")
+    entry_count_var = tk.StringVar(value="Items: 0 shown / 0 total")
     pacing_var = url_preview_pacing_var
     thumbnail_mode_var = url_preview_thumbnail_mode_var
     rate_limit_thumbnails_var = url_preview_rate_limit_thumbnails_var
@@ -9694,6 +9707,45 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     def short_text(value, limit=160):
         value = str(value or "").replace("\r", " ").replace("\n", " ").strip()
         return value if len(value) <= limit else value[:limit - 1] + "…"
+
+    def split_filter_terms(value):
+        return [term.casefold() for term in re.split(r"\s+", str(value or "").strip()) if term]
+
+    def filter_terms_match(text_value, terms):
+        if not terms:
+            return True
+        haystack = str(text_value or "").casefold()
+        return all(term in haystack for term in terms)
+
+    def url_record_filter_text(record):
+        record = record or {}
+        data = record.get("json") if isinstance(record.get("json"), dict) else {}
+        fields = [
+            record.get("status", ""), record.get("kind", ""), record.get("title", ""),
+            record.get("uploader", ""), record.get("duration", ""), record.get("items", ""),
+            record.get("thumbnail_status", ""), record.get("thumbnail_url", ""), record.get("url", ""),
+            data.get("extractor", ""), data.get("extractor_key", ""), data.get("id", ""),
+            data.get("playlist", ""), data.get("playlist_title", ""), data.get("playlist_id", ""),
+        ]
+        return " ".join(str(field or "") for field in fields)
+
+    def entry_record_filter_text(entry):
+        entry = entry or {}
+        data = entry.get("json") if isinstance(entry.get("json"), dict) else {}
+        fields = [
+            entry.get("index", ""), entry.get("status", ""), entry.get("title", ""),
+            entry.get("uploader", ""), entry.get("duration", ""), entry.get("thumbnail_status", ""),
+            entry.get("thumbnail_url", ""), entry.get("url", ""), data.get("extractor", ""),
+            data.get("extractor_key", ""), data.get("id", ""), data.get("playlist", ""),
+            data.get("playlist_title", ""), data.get("playlist_id", ""),
+        ]
+        return " ".join(str(field or "") for field in fields)
+
+    def url_record_matches_filter(record):
+        return filter_terms_match(url_record_filter_text(record), split_filter_terms(url_filter_var.get()))
+
+    def entry_record_matches_filter(entry):
+        return filter_terms_match(entry_record_filter_text(entry), split_filter_terms(entry_filter_var.get()))
 
     def get_preview_timeout_seconds():
         try:
@@ -9773,13 +9825,19 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         root_value = output_root_var.get().strip() or ROOT
         return root_value
 
+    def url_preview_temp_cache_folder_path():
+        return os.path.join(output_root_for_preview_cache(), ".gui-cache", "url-preview-pending")
+
+    def url_preview_persistent_cache_folder_path():
+        return os.path.join(output_root_for_preview_cache(), ".gui-cache", "url-preview-persistent")
+
     def url_preview_temp_cache_folder():
-        folder = os.path.join(output_root_for_preview_cache(), ".gui-cache", "url-preview-pending")
+        folder = url_preview_temp_cache_folder_path()
         os.makedirs(folder, exist_ok=True)
         return folder
 
     def url_preview_persistent_cache_folder():
-        folder = os.path.join(output_root_for_preview_cache(), ".gui-cache", "url-preview-persistent")
+        folder = url_preview_persistent_cache_folder_path()
         os.makedirs(folder, exist_ok=True)
         return folder
 
@@ -9792,7 +9850,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         except Exception:
             return False
 
-    def resolved_preview_cache_folder(playlist_name=None):
+    def resolved_preview_cache_folder_path(playlist_name=None):
         try:
             output_root = output_root_for_preview_cache()
             template = case_name_var.get().strip()
@@ -9803,11 +9861,14 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             if not case_name:
                 raise ValueError("blank resolved case name")
             case_folder = os.path.join(output_root, case_name)
-            folder = os.path.join(case_folder, "manifests", ".gui-cache", "url-preview")
-            os.makedirs(folder, exist_ok=True)
-            return folder
+            return os.path.join(case_folder, "manifests", ".gui-cache", "url-preview")
         except Exception:
-            return url_preview_temp_cache_folder()
+            return url_preview_temp_cache_folder_path()
+
+    def resolved_preview_cache_folder(playlist_name=None):
+        folder = resolved_preview_cache_folder_path(playlist_name=playlist_name)
+        os.makedirs(folder, exist_ok=True)
+        return folder
 
     def preview_cache_folder(playlist_name=None):
         if url_preview_cache_is_persistent():
@@ -9865,6 +9926,95 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         except Exception as e:
             append_log(f"WARNING: Could not move URL Preview cache into resolved case folder: {e}\n")
         return target
+
+    def clear_url_preview_cache():
+        targets = [
+            url_preview_temp_cache_folder_path(),
+            url_preview_persistent_cache_folder_path(),
+            resolved_preview_cache_folder_path(),
+        ]
+
+        try:
+            playlist_names = set()
+            for record in url_records:
+                try:
+                    playlist_name = playlist_name_for_record(record)
+                except Exception:
+                    playlist_name = ""
+                if playlist_name:
+                    playlist_names.add(playlist_name)
+            for playlist_name in sorted(playlist_names):
+                targets.append(resolved_preview_cache_folder_path(playlist_name=playlist_name))
+        except Exception:
+            pass
+
+        unique_targets = []
+        seen = set()
+        for target in targets:
+            if not target:
+                continue
+            try:
+                key = os.path.normcase(os.path.abspath(target))
+            except Exception:
+                key = target
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_targets.append(target)
+
+        existing_targets = [target for target in unique_targets if os.path.isdir(target)]
+        if not existing_targets:
+            messagebox.showinfo("Clear URL Preview Cache", "No URL Preview cache folders were found for the current Output Root/case context.", parent=dialog)
+            return
+
+        if not messagebox.askyesno(
+            "Clear URL Preview Cache",
+            "Clear URL Preview thumbnail/cache folders for the current Output Root and resolved case context?\n\n"
+            "This removes only GUI cache folders, not captured media or case manifests.",
+            parent=dialog,
+        ):
+            return
+
+        removed = 0
+        failed = []
+        for target in existing_targets:
+            try:
+                shutil.rmtree(target)
+                removed += 1
+            except Exception as e:
+                failed.append(f"{target}: {e}")
+
+        def reset_thumbnail_record(record):
+            if not isinstance(record, dict):
+                return
+            record["thumbnail_cache_path"] = ""
+            record["thumbnail_error"] = ""
+            if str(record.get("thumbnail_url") or "").strip():
+                record["thumbnail_status"] = "URL"
+            else:
+                record["thumbnail_status"] = "Missing"
+            update_preview_row(record)
+
+        for record in url_records:
+            reset_thumbnail_record(record)
+            for entry in list(record.get("entries") or []):
+                reset_thumbnail_record(entry)
+
+        with thumbnail_state_lock:
+            thumbnail_state["desired_key"] = ""
+            thumbnail_state["desired_record"] = None
+
+        clear_thumbnail("URL Preview cache cleared")
+        set_details_text(format_record_details(current_detail_record.get("record")))
+        populate_url_tree()
+        populate_entry_tree(current_url_record())
+
+        if failed:
+            detail = "\n".join(failed[:6])
+            messagebox.showwarning("Clear URL Preview Cache", f"Cleared {removed} cache folder(s), but some folders could not be removed:\n\n{detail}", parent=dialog)
+        else:
+            messagebox.showinfo("Clear URL Preview Cache", f"Cleared {removed} URL Preview cache folder(s).", parent=dialog)
+        status_var.set(f"Cleared {removed} URL Preview cache folder(s).")
 
     def choose_thumbnail_url(info):
         info = info if isinstance(info, dict) else {}
@@ -10107,8 +10257,14 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     def update_url_tree_row(iid):
         try:
             record = url_by_iid.get(iid)
-            if not record or not url_tree.exists(iid):
+            if not record:
                 return
+            if not url_record_matches_filter(record):
+                if url_tree.exists(iid):
+                    url_tree.delete(iid)
+                return
+            if not url_tree.exists(iid):
+                url_tree.insert("", "end", iid=iid, values=("", "", "", "", "", "", "", "", "", "", ""))
             url_tree.item(
                 iid,
                 values=(
@@ -10131,8 +10287,14 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     def update_entry_tree_row(iid):
         try:
             entry = entry_by_iid.get(iid)
-            if not entry or not entry_tree.exists(iid):
+            if not entry:
                 return
+            if not entry_record_matches_filter(entry):
+                if entry_tree.exists(iid):
+                    entry_tree.delete(iid)
+                return
+            if not entry_tree.exists(iid):
+                entry_tree.insert("", "end", iid=iid, values=("", "", "", "", "", "", "", ""))
             entry_tree.item(
                 iid,
                 values=(
@@ -10208,8 +10370,14 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     def all_top_records():
         return unique_valid_top_records(url_records)
 
+    def visible_top_records():
+        return unique_valid_top_records([record for record in url_records if url_record_matches_filter(record)])
+
+    def top_all_action_records():
+        return visible_top_records() if url_filter_is_active() else all_top_records()
+
     def top_records_for_start_or_queue(selected_only=False):
-        return include_checked_top_records() if selected_only else all_top_records()
+        return include_checked_top_records() if selected_only else top_all_action_records()
 
     def included_top_records(selected_only=False):
         return top_records_for_start_or_queue(selected_only)
@@ -10251,15 +10419,23 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             return ""
         return playlist_name_for_record(records[0])
 
-    def current_playlist_entries(included_only=True, selected_only=False):
+    def current_playlist_entries(included_only=True, selected_only=False, visible_only=False):
         record = current_url_record()
         entries = list((record or {}).get("entries", []))
         if selected_only:
             selected_ids = {id(entry) for entry in selected_entry_records()}
             entries = [entry for entry in entries if id(entry) in selected_ids]
+        if visible_only:
+            entries = [entry for entry in entries if entry_record_matches_filter(entry)]
         if included_only:
             entries = [entry for entry in entries if entry.get("include")]
         return entries
+
+    def url_filter_is_active():
+        return bool(str(url_filter_var.get() or "").strip())
+
+    def entry_filter_is_active():
+        return bool(str(entry_filter_var.get() or "").strip())
 
     def urls_from_entries(entries):
         urls_to_use = []
@@ -10767,7 +10943,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         update_url_tree_row(record.get("iid", ""))
 
     def records_for_preview(selected_only=False):
-        return preview_checked_top_records() if selected_only else all_top_records()
+        return preview_checked_top_records() if selected_only else top_all_action_records()
 
     def warn_if_many_preview_urls(count):
         if count <= 10:
@@ -10876,6 +11052,34 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         stop_event.set()
         status_var.set("Stopping URL preview after current URL...")
 
+    def top_all_action_label(base_text):
+        return base_text.replace("All", "Visible") if url_filter_is_active() else base_text
+
+    def top_all_action_description():
+        return "visible usable top-level URL(s)" if url_filter_is_active() else "all usable top-level URL(s)"
+
+    def playlist_all_item_label(base_text):
+        return base_text.replace("All Items", "Visible Items") if entry_filter_is_active() else base_text
+
+    def playlist_all_item_description():
+        return "visible playlist item URL(s)" if entry_filter_is_active() else "playlist item URL(s)"
+
+    def all_action_playlist_entries():
+        return current_playlist_entries(False, False, visible_only=entry_filter_is_active())
+
+    def update_context_sensitive_action_labels():
+        try:
+            preview_all_button.configure(text=top_all_action_label("Preview All"))
+            start_all_button.configure(text=top_all_action_label("Start All"))
+            queue_all_button.configure(text=top_all_action_label("Queue All"))
+        except Exception:
+            pass
+        try:
+            playlist_start_all_button.configure(text=playlist_all_item_label("Start All Items"))
+            playlist_queue_all_button.configure(text=playlist_all_item_label("Queue All Items"))
+        except Exception:
+            pass
+
     def set_buttons_scanning(is_scanning):
         scan_running["value"] = is_scanning
         try:
@@ -10911,12 +11115,43 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
                 except Exception:
                     pass
 
+    def update_url_filter_count_label():
+        total = len(url_records)
+        shown = sum(1 for record in url_records if url_record_matches_filter(record))
+        url_count_var.set(f"URLs: {shown} shown / {total} total")
+
+        update_context_sensitive_action_labels()
+
+        if scan_running.get("value"):
+            return
+
+        if total and shown == 0 and url_filter_is_active():
+            status_var.set("No URL rows match the current filter.")
+        elif has_preview_urls:
+            status_var.set(f"Loaded {total} URL(s). Use Preview All/Checked to gather metadata.")
+        else:
+            status_var.set(f"{no_urls_message} Add URLs in the URL box or select Input File(s) to enable URL Preview.")
+
+    def update_entry_filter_count_label(record=None):
+        record = record or current_url_record()
+        entries = list((record or {}).get("entries", []))
+        total = len(entries)
+        shown = sum(1 for entry in entries if entry_record_matches_filter(entry))
+        entry_count_var.set(f"Items: {shown} shown / {total} total")
+
+        update_context_sensitive_action_labels()
+
+        if total and shown == 0 and entry_filter_is_active():
+            context_title_var.set("No playlist/context items match the current filter.")
+        elif record and total:
+            context_title_var.set(f"Playlist/context items: {record.get('title') or record.get('url')} ({shown} shown / {total} item(s))")
+
     def populate_url_tree():
         for item in url_tree.get_children():
             url_tree.delete(item)
         for record in url_records:
-            url_tree.insert("", "end", iid=record["iid"], values=("", "", "", "", "", "", "", "", "", "", ""))
             update_url_tree_row(record["iid"])
+        update_url_filter_count_label()
 
     def populate_entry_tree(record):
         entry_by_iid.clear()
@@ -10927,8 +11162,8 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             iid = f"{record.get('iid', 'url')}:entry-{index}"
             entry["iid"] = iid
             entry_by_iid[iid] = entry
-            entry_tree.insert("", "end", iid=iid, values=("", "", "", "", "", "", "", "", ""))
             update_entry_tree_row(iid)
+        update_entry_filter_count_label(record)
 
     def set_details_text(text_value):
         details_text.configure(state="normal")
@@ -11432,11 +11667,11 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     preview_selected_button = pack_preview_button(ttk.Button(url_action_frame, text="Preview Checked", command=lambda: start_preview(True)))
     action_buttons.append(preview_selected_button)
     stop_button = pack_preview_button(ttk.Button(url_action_frame, text="Stop", command=stop_preview, state="disabled"))
-    start_all_button = pack_preview_button(ttk.Button(url_action_frame, text="Start All", command=lambda: start_top_urls(False, "all usable top-level URL(s)")))
+    start_all_button = pack_preview_button(ttk.Button(url_action_frame, text="Start All", command=lambda: start_top_urls(False, top_all_action_description())))
     action_buttons.append(start_all_button)
     start_selected_button = pack_preview_button(ttk.Button(url_action_frame, text="Start Included", command=lambda: start_top_urls(True, "included top-level URL(s)")))
     action_buttons.append(start_selected_button)
-    queue_all_button = pack_preview_button(ttk.Button(url_action_frame, text="Queue All", command=lambda: queue_top_urls(False, "all usable top-level URL(s)")))
+    queue_all_button = pack_preview_button(ttk.Button(url_action_frame, text="Queue All", command=lambda: queue_top_urls(False, top_all_action_description())))
     action_buttons.append(queue_all_button)
     queue_selected_button = pack_preview_button(ttk.Button(url_action_frame, text="Queue Included", command=lambda: queue_top_urls(True, "included top-level URL(s)")))
     action_buttons.append(queue_selected_button)
@@ -11446,7 +11681,15 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     url_frame = ttk.LabelFrame(dialog, text="URLs", padding=8)
     url_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 8))
     url_frame.columnconfigure(0, weight=1)
-    url_frame.rowconfigure(0, weight=1)
+    url_frame.rowconfigure(1, weight=1)
+
+    url_filter_frame = ttk.Frame(url_frame)
+    url_filter_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+    url_filter_frame.columnconfigure(1, weight=1)
+    ttk.Label(url_filter_frame, text="Filter URLs").grid(row=0, column=0, sticky="w", padx=(0, 6))
+    ttk.Entry(url_filter_frame, textvariable=url_filter_var).grid(row=0, column=1, sticky="ew", padx=(0, 6))
+    ttk.Button(url_filter_frame, text="Clear", command=lambda: url_filter_var.set("")).grid(row=0, column=2, sticky="e")
+    ttk.Label(url_filter_frame, textvariable=url_count_var).grid(row=0, column=3, sticky="e", padx=(8, 0))
 
     url_tree = ttk.Treeview(
         url_frame,
@@ -11472,15 +11715,16 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     url_tree.column("items", width=65, anchor="e", stretch=False)
     url_tree.column("thumb", width=95, stretch=False)
     url_tree.column("url", width=430)
-    url_tree.grid(row=0, column=0, sticky="nsew")
+    url_tree.grid(row=1, column=0, sticky="nsew")
     url_scroll_y = ttk.Scrollbar(url_frame, orient="vertical", command=url_tree.yview)
-    url_scroll_y.grid(row=0, column=1, sticky="ns")
+    url_scroll_y.grid(row=1, column=1, sticky="ns")
     url_scroll_x = ttk.Scrollbar(url_frame, orient="horizontal", command=url_tree.xview)
-    url_scroll_x.grid(row=1, column=0, sticky="ew")
+    url_scroll_x.grid(row=2, column=0, sticky="ew")
     url_tree.configure(yscrollcommand=url_scroll_y.set, xscrollcommand=url_scroll_x.set)
     url_tree.bind("<<TreeviewSelect>>", on_url_tree_select)
     url_tree.bind("<Button-1>", on_url_tree_click)
     url_tree.bind("<Double-1>", on_url_tree_double_click)
+    url_filter_var.trace_add("write", lambda *args: populate_url_tree())
     populate_url_tree()
 
     bottom_outer = ttk.LabelFrame(dialog, text="Selected URL Context", padding=8)
@@ -11513,6 +11757,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     ).grid(row=1, column=4, columnspan=2, sticky="w", padx=(0, 12), pady=2)
     ttk.Label(options_panel, text="Cache mode").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=2)
     ttk.Combobox(options_panel, textvariable=cache_mode_var, values=cache_mode_options, state="readonly", width=24).grid(row=2, column=1, columnspan=3, sticky="w", padx=(0, 12), pady=2)
+    ttk.Button(options_panel, text="Clear URL Preview Cache", command=clear_url_preview_cache).grid(row=2, column=4, columnspan=2, sticky="w", padx=(0, 12), pady=2)
     options_panel.grid_remove()
 
     preview_options_bar = ttk.Frame(dialog)
@@ -11627,9 +11872,9 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         widget.pack(side="left", padx=(0, 6), pady=2)
         return widget
 
-    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Start All Items", command=lambda: start_urls_now(urls_from_entries(current_playlist_entries(False, False)), "playlist item URL(s)", playlist_name=get_current_playlist_name())))
+    playlist_start_all_button = pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Start All Items", command=lambda: start_urls_now(urls_from_entries(all_action_playlist_entries()), playlist_all_item_description(), playlist_name=get_current_playlist_name())))
     pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Start Included Items", command=lambda: start_urls_now(urls_from_entries(included_entry_records()), "included playlist item URL(s)", playlist_name=get_current_playlist_name())))
-    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Queue All Items", command=lambda: queue_urls(urls_from_entries(current_playlist_entries(False, False)), "playlist item URL(s)", playlist_name=get_current_playlist_name())))
+    playlist_queue_all_button = pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Queue All Items", command=lambda: queue_urls(urls_from_entries(all_action_playlist_entries()), playlist_all_item_description(), playlist_name=get_current_playlist_name())))
     pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Queue Included Items", command=lambda: queue_urls(urls_from_entries(included_entry_records()), "included playlist item URL(s)", playlist_name=get_current_playlist_name())))
     pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Copy Included URLs", command=lambda: copy_text_to_clipboard("\n".join(urls_from_entries(current_playlist_entries(True, False))), "included playlist item URL(s)")))
     pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Load Included URLs", command=lambda: set_url_box_from_current_items(False)))
@@ -11641,7 +11886,16 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     entry_frame = ttk.LabelFrame(playlist_frame, text="Playlist / Context URLs", padding=8)
     entry_frame.grid(row=1, column=0, sticky="nsew")
     entry_frame.columnconfigure(0, weight=1)
-    entry_frame.rowconfigure(0, weight=1)
+    entry_frame.rowconfigure(1, weight=1)
+
+    entry_filter_frame = ttk.Frame(entry_frame)
+    entry_filter_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+    entry_filter_frame.columnconfigure(1, weight=1)
+    ttk.Label(entry_filter_frame, text="Filter items").grid(row=0, column=0, sticky="w", padx=(0, 6))
+    ttk.Entry(entry_filter_frame, textvariable=entry_filter_var).grid(row=0, column=1, sticky="ew", padx=(0, 6))
+    ttk.Button(entry_filter_frame, text="Clear", command=lambda: entry_filter_var.set("")).grid(row=0, column=2, sticky="e")
+    ttk.Label(entry_filter_frame, textvariable=entry_count_var).grid(row=0, column=3, sticky="e", padx=(8, 0))
+
     entry_tree = ttk.Treeview(
         entry_frame,
         columns=("include", "index", "status", "title", "duration", "thumb", "json", "url"),
@@ -11662,15 +11916,16 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     entry_tree.column("thumb", width=95, stretch=False)
     entry_tree.column("json", width=60, anchor="center", stretch=False)
     entry_tree.column("url", width=380)
-    entry_tree.grid(row=0, column=0, sticky="nsew")
+    entry_tree.grid(row=1, column=0, sticky="nsew")
     entry_scroll_y = ttk.Scrollbar(entry_frame, orient="vertical", command=entry_tree.yview)
-    entry_scroll_y.grid(row=0, column=1, sticky="ns")
+    entry_scroll_y.grid(row=1, column=1, sticky="ns")
     entry_scroll_x = ttk.Scrollbar(entry_frame, orient="horizontal", command=entry_tree.xview)
-    entry_scroll_x.grid(row=1, column=0, sticky="ew")
+    entry_scroll_x.grid(row=2, column=0, sticky="ew")
     entry_tree.configure(yscrollcommand=entry_scroll_y.set, xscrollcommand=entry_scroll_x.set)
     entry_tree.bind("<<TreeviewSelect>>", on_entry_tree_select)
     entry_tree.bind("<Button-1>", on_entry_tree_click)
     entry_tree.bind("<Double-1>", on_entry_tree_double_click)
+    entry_filter_var.trace_add("write", lambda *args: populate_entry_tree(current_url_record()))
 
     details_frame.grid(row=1, column=0, columnspan=2, sticky="nsew")
     details_frame.tkraise()
@@ -13766,6 +14021,8 @@ def open_case_browser(select_tab=True, silent=False):
     browser_sort_var = case_browser_sort_var
     browser_current_only_var = case_browser_current_only_var
     browser_icon_scale_var = case_browser_icon_scale_var
+    browser_search_var = tk.StringVar(value="")
+    browser_search_after_id = {"value": None}
 
     def save_case_browser_preferences():
         save_app_settings(show_popup=False)
@@ -13777,6 +14034,14 @@ def open_case_browser(select_tab=True, silent=False):
         except NameError:
             # During window construction, render_files/get_selected_browser_folder are defined later.
             pass
+
+    def schedule_browser_search_refresh(*args):
+        try:
+            if browser_search_after_id["value"]:
+                root.after_cancel(browser_search_after_id["value"])
+        except Exception:
+            pass
+        browser_search_after_id["value"] = root.after(250, refresh_browser_view)
 
     def get_browser_icon_geometry():
         scale = browser_icon_scale_var.get()
@@ -13898,6 +14163,7 @@ def open_case_browser(select_tab=True, silent=False):
     browser_controls = ttk.Frame(right_frame)
     browser_controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
     browser_controls.columnconfigure(5, weight=1)
+    browser_controls.columnconfigure(1, weight=1)
 
     ttk.Label(browser_controls, text="Filter").grid(row=0, column=0, sticky="w", padx=(0, 4))
     filter_menu = ttk.Combobox(
@@ -13936,6 +14202,12 @@ def open_case_browser(select_tab=True, silent=False):
     )
     scale_menu.grid(row=0, column=6, sticky="e")
 
+    ttk.Label(browser_controls, text="Search").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
+    browser_search_entry = ttk.Entry(browser_controls, textvariable=browser_search_var)
+    browser_search_entry.grid(row=1, column=1, columnspan=5, sticky="ew", padx=(0, 8), pady=(6, 0))
+    ttk.Button(browser_controls, text="Clear", command=lambda: browser_search_var.set("")).grid(row=1, column=6, sticky="e", pady=(6, 0))
+    browser_search_var.trace_add("write", schedule_browser_search_refresh)
+
     canvas = tk.Canvas(right_frame, highlightthickness=0)
     canvas.grid(row=2, column=0, sticky="nsew")
 
@@ -13973,28 +14245,6 @@ def open_case_browser(select_tab=True, silent=False):
     case_browser_ignored_folder_names = {".gui-cache", "__pycache__"}
     case_browser_ignored_file_names = {".ds_store", "desktop.ini", "thumbs.db"}
 
-    def folder_contains_meaningful_case_files(folder_path):
-        """Return True when a top-level folder looks like a real case, not only GUI cache."""
-
-        if not os.path.isdir(folder_path):
-            return False
-
-        try:
-            for root_dir, dir_names, file_names in os.walk(folder_path):
-                dir_names[:] = [
-                    name for name in dir_names
-                    if name.lower() not in case_browser_ignored_folder_names
-                ]
-
-                for file_name in file_names:
-                    if file_name.lower() in case_browser_ignored_file_names:
-                        continue
-                    return True
-        except Exception:
-            return False
-
-        return False
-
     def build_folder_tree_snapshot(folder_path, max_depth=4, depth=0):
         if depth > max_depth:
             return []
@@ -14010,7 +14260,7 @@ def open_case_browser(select_tab=True, silent=False):
         if depth == 0:
             entries = [
                 entry for entry in entries
-                if folder_contains_meaningful_case_files(entry.path)
+                if case_folder_is_populated(entry.path)
             ]
 
         entries.sort(key=lambda entry: entry.name.lower())
@@ -14204,8 +14454,31 @@ def open_case_browser(select_tab=True, silent=False):
 
         return True
 
-    def list_display_files(folder_path, selected_filter, current_only, sort_mode):
+    def list_display_files(folder_path, selected_filter, current_only, sort_mode, search_query=""):
         display_files = []
+        total_after_type_filter = 0
+        search_terms = [term.casefold() for term in re.split(r"\s+", str(search_query or "").strip()) if term]
+
+        def file_matches_browser_search(path):
+            if not search_terms:
+                return True
+            try:
+                rel_folder = os.path.relpath(path, folder_path)
+            except Exception:
+                rel_folder = path
+            try:
+                rel_output = os.path.relpath(path, output_root)
+            except Exception:
+                rel_output = path
+            fields = [
+                os.path.basename(path),
+                os.path.splitext(path)[1],
+                rel_folder,
+                rel_output,
+                get_browser_sort_domain(path, folder_path),
+            ]
+            haystack = " ".join(str(field or "") for field in fields).casefold()
+            return all(term in haystack for term in search_terms)
 
         if current_only:
             try:
@@ -14216,7 +14489,9 @@ def open_case_browser(select_tab=True, silent=False):
             for name in names:
                 path = os.path.join(folder_path, name)
                 if os.path.isfile(path) and file_matches_browser_filter_value(path, selected_filter):
-                    display_files.append(path)
+                    total_after_type_filter += 1
+                    if file_matches_browser_search(path):
+                        display_files.append(path)
         else:
             for root_dir, dir_names, file_names in os.walk(folder_path):
                 dir_names[:] = [
@@ -14227,7 +14502,9 @@ def open_case_browser(select_tab=True, silent=False):
                 for file_name in file_names:
                     path = os.path.join(root_dir, file_name)
                     if file_matches_browser_filter_value(path, selected_filter):
-                        display_files.append(path)
+                        total_after_type_filter += 1
+                        if file_matches_browser_search(path):
+                            display_files.append(path)
 
         if sort_mode == "Domain":
             display_files.sort(key=lambda p: (get_browser_sort_domain(p, folder_path), not is_browser_media_file(p), os.path.basename(p).lower()))
@@ -14242,15 +14519,24 @@ def open_case_browser(select_tab=True, silent=False):
         else:
             display_files.sort(key=lambda p: (not is_browser_media_file(p), os.path.basename(p).lower()))
 
-        return display_files
+        return display_files, total_after_type_filter
 
-    def render_file_cards(folder_path, files):
+    def render_file_cards(folder_path, files, total_count=None, search_query="", selected_filter="All"):
         clear_content()
         render_generation = file_render_generation["value"]
-        browser_status_var.set(f"{folder_path} - {len(files)} file(s)")
+        total_count = len(files) if total_count is None else total_count
+        browser_status_var.set(f"{folder_path} - {len(files)} shown / {total_count} file(s)")
 
         if not files:
-            ttk.Label(content_frame, text="No media or sidecar files found in this folder.").grid(row=0, column=0, sticky="w", padx=12, pady=12)
+            if str(search_query or "").strip():
+                message = "No files match the current Case Browser search/filter."
+            elif selected_filter != "All":
+                message = f"No files match the current Case Browser filter: {selected_filter}."
+            elif os.path.normcase(os.path.abspath(folder_path)) == os.path.normcase(os.path.abspath(output_root)):
+                message = "No captured case files found. Preview-only cache folders are hidden."
+            else:
+                message = "No media or sidecar files found in this folder."
+            ttk.Label(content_frame, text=message).grid(row=0, column=0, sticky="w", padx=12, pady=12)
             return
 
         geometry = get_browser_icon_geometry()
@@ -14450,6 +14736,7 @@ def open_case_browser(select_tab=True, silent=False):
         selected_filter = browser_filter_var.get()
         current_only = bool(browser_current_only_var.get())
         sort_mode = browser_sort_var.get()
+        search_query = browser_search_var.get()
 
         clear_content()
         browser_status_var.set(f"Loading files from: {folder_path}")
@@ -14457,7 +14744,7 @@ def open_case_browser(select_tab=True, silent=False):
 
         def worker():
             try:
-                files = list_display_files(folder_path, selected_filter, current_only, sort_mode)
+                files, total_count = list_display_files(folder_path, selected_filter, current_only, sort_mode, search_query)
                 error = ""
             except Exception as e:
                 files = []
@@ -14473,7 +14760,7 @@ def open_case_browser(select_tab=True, silent=False):
                     ttk.Label(content_frame, text=f"Could not list files:\n\n{error}").grid(row=0, column=0, sticky="w", padx=12, pady=12)
                     return
 
-                render_file_cards(folder_path, files)
+                render_file_cards(folder_path, files, total_count=total_count, search_query=search_query, selected_filter=selected_filter)
 
             enqueue_case_browser_ui(apply_result)
 
