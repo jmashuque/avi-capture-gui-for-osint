@@ -11,15 +11,17 @@ A portable Windows GUI for approved audio/video/image capture workflows using `y
 - [What the App Does Not Do](#what-the-app-does-not-do)
 - [Required Components](#required-components)
 - [Basic Usage](#basic-usage)
+  - [Setup and Staging](#setup-and-staging)
   - [Start a Capture](#start-a-capture)
   - [Use the Job Queue](#use-the-job-queue)
+  - [Resume Interrupted Captures](#resume-interrupted-captures)
   - [Preview Audio/Video Links](#preview-audiovideo-links)
   - [Review a Case](#review-a-case)
 - [Advanced Usage](#advanced-usage)
   - [Portable Layout](#portable-layout)
   - [Audio/Video Capture](#audiovideo-capture)
   - [Image Capture](#image-capture)
-  - [Job Queue and Recovery](#job-queue-and-recovery)
+  - [Job Queue, Persistence, and Recovery](#job-queue-persistence-and-recovery)
   - [Domain Presets, Proxy, VPN, and Archives](#domain-presets-proxy-vpn-and-archives)
   - [Update Checks](#update-checks)
 - [Profiles and Settings](#profiles-and-settings)
@@ -116,6 +118,7 @@ Required files/tools:
 
 Recommended source pages:
 
+- AVI Capture GUI releases: <https://github.com/jmashuque/avi-capture-gui-for-osint/releases/latest>
 - Python: <https://apps.microsoft.com/detail/9PNRBTZXMB4Z>
 - yt-dlp releases: <https://github.com/yt-dlp/yt-dlp/releases>
 - yt-dlp nightly builds: <https://github.com/yt-dlp/yt-dlp-nightly-builds/releases>
@@ -127,20 +130,103 @@ Use approved releases for your environment. For FFmpeg, the Gyan.dev release ess
 
 ## Basic Usage
 
-This section is for normal users who only need to run approved captures. Most users should not need to change Advanced Options.
+This section is for normal users who only need to stage the app and run approved captures. Most users should not need to change Advanced Options.
+
+### Setup and Staging
+
+Do this once before the first capture, or whenever you are preparing a fresh copy of the app. Use organization-approved download locations or staged files when your environment provides them.
+
+1. Create a local folder for the app, such as:
+
+   ```text
+   C:\AVI-Capture-GUI
+   ```
+
+2. Download the latest AVI Capture GUI release ZIP from:
+
+   ```text
+   https://github.com/jmashuque/avi-capture-gui-for-osint/releases/latest
+   ```
+
+3. Right-click the downloaded ZIP, choose **Properties**, select **Unblock** if that option appears, then choose **Extract All**. Do not run the app from inside the ZIP.
+
+4. Move or extract the app files into the local app folder. The folder should contain at least:
+
+   ```text
+   gui.py
+   script-ytdlp.ps1
+   script-gallerydl.ps1
+   README.md
+   VERSION.txt
+   VERIFY_HASHES.txt
+   ```
+
+5. Install Python 3 if it is not already installed. The easiest user-facing option is the Microsoft Store Python 3 package. If your organization uses Software Center, Company Portal, Intune, winget, or another approved source, use that instead.
+
+6. Download the required capture tools and place the executable files in the same app folder unless your team gives you a different staged folder:
+
+   | Tool | What to place in the app folder | Source page |
+   |---|---|---|
+   | yt-dlp | `yt-dlp.exe` | <https://github.com/yt-dlp/yt-dlp/releases> |
+   | gallery-dl | `gallery-dl.exe` | <https://codeberg.org/mikf/gallery-dl/releases> |
+   | Deno | `deno.exe` | <https://github.com/denoland/deno/releases> |
+   | FFmpeg | `ffmpeg.exe` and `ffprobe.exe` | <https://www.gyan.dev/ffmpeg/builds/> |
+
+   For FFmpeg, download a Windows release build, open the ZIP, then copy `ffmpeg.exe` and `ffprobe.exe` from the `bin` folder into the app folder.
+
+7. Confirm the app folder now looks similar to this:
+
+   ```text
+   C:\AVI-Capture-GUI\
+     gui.py
+     script-ytdlp.ps1
+     script-gallerydl.ps1
+     yt-dlp.exe
+     gallery-dl.exe
+     deno.exe
+     ffmpeg.exe
+     ffprobe.exe
+   ```
+
+Keep this folder together. `deno.exe` should be beside `yt-dlp.exe`. Keep the app on a local drive during active captures instead of running it from inside the ZIP, email attachment, browser download preview, or network share.
 
 ### Start a Capture
 
-1. Open `gui.py` with Python.
-2. Choose the correct tab:
+1. Open the app folder in File Explorer.
+
+2. Start the GUI. Use one of these methods:
+
+   - If `.py` files already open with Python, double-click `gui.py`.
+   - If double-clicking does not work, click the File Explorer address bar, type `powershell`, and press **Enter**. In the PowerShell window that opens, run:
+
+     ```powershell
+     py .\gui.py
+     ```
+
+   - If Windows says `py` is not recognized, try:
+
+     ```powershell
+     python .\gui.py
+     ```
+
+   - If both commands fail, Python is not installed or is not available to the user session. Install Python through an approved source or ask IT to stage it.
+
+3. Choose the correct tab:
+
    - **Audio/Video Capture** for video, audio, and supported media posts handled by `yt-dlp`.
    - **Image Capture** for image links, galleries, albums, and supported photo-post sources handled by `gallery-dl`.
-3. Confirm the tool paths shown on the tab.
-4. Enter or keep the case name.
-5. Paste approved URLs into the URL box, or select an input file containing one URL per line.
-6. Run **Preflight Check**.
-7. Click **Start Capture**.
-8. Review the output log and case folder when the run completes.
+
+4. Confirm the tool paths shown on the tab. If a path is blank or points to the wrong folder, use the browse button beside that field.
+
+5. Enter or keep the case name. The app resolves the final case folder before capture.
+
+6. Paste approved URLs into the URL box, or select an input file containing one URL per line.
+
+7. Run **Preflight Check**. Fix any missing tool or folder warning before starting the capture.
+
+8. Click **Start Capture**.
+
+9. Leave the app open until the capture finishes, then review the output log and case folder.
 
 The URL box takes priority over input files. Clear the URL box if you want the selected input file to be used instead.
 
@@ -154,7 +240,22 @@ Use **Job Queue** when you want to prepare several captures before running them.
 4. Leave the app open while the queue runs.
 5. Review failed or interrupted jobs after the run.
 
-When Job Persistence is enabled, interrupted jobs can be continued later from the queue. Audio/video jobs continue from completed URL markers. Image jobs retry through gallery-dl archive-backed skipping.
+The Job Queue is also where interrupted work is resumed when **Job Persistence** is enabled.
+
+### Resume Interrupted Captures
+
+If the app closes, crashes, or a capture is stopped while **Job Persistence** is enabled, reopen the app and go to **Job Queue**. The interrupted capture should appear with an **Interrupted** status.
+
+To resume it:
+
+1. Open **Job Queue**.
+2. Select the interrupted job.
+3. Use **Continue Checked Interrupted** or right-click the highlighted job and choose **Continue Highlighted Interrupted**.
+4. Leave the app open while the resumed queue job runs.
+
+Direct captures are also saved as running recovery jobs only when **Job Persistence** is enabled. If Job Persistence is disabled, direct captures are not saved to the queue and cannot be resumed from the app after a close or crash.
+
+Audio/Video jobs continue from the first URL that was not fully marked complete. Image jobs resubmit the original URLs and rely on gallery-dl archive skipping to avoid repeating completed items.
 
 ### Preview Audio/Video Links
 
@@ -234,18 +335,24 @@ Useful advanced controls include:
 
 The image filename template is relative to the case `media` folder. Case/context tags resolve when the job is created. gallery-dl item tags resolve per downloaded item.
 
-### Job Queue and Recovery
+### Job Queue, Persistence, and Recovery
 
-The Job Queue supports both `yt-dlp` and `gallery-dl` jobs.
+The Job Queue runs staged work, manages concurrent captures, and resumes interrupted jobs. It supports both `yt-dlp` and `gallery-dl` jobs.
 
-Key behavior:
+**Job Persistence** controls whether queue state is saved to `gui-jobs.json`. When it is enabled, queued jobs and direct captures are saved while they run. If a running job is still present when the app reopens, it is treated as interrupted and can be continued from the Job Queue. When Job Persistence is disabled, direct captures are not recoverable through the app after a close or crash.
 
-- queued jobs keep the settings they were created with
-- Audio/Video and Image Capture have separate concurrent-capture limits
-- `yt-dlp` and `gallery-dl` jobs may run at the same time when their domains do not collide
-- same-domain concurrent jobs trigger a collision prompt
-- direct captures are saved as recoverable queue jobs only when Job Persistence is enabled
-- recovery manifests are written under the case `manifests` folder
+Recovery behavior is engine-specific:
+
+- **Audio/Video Capture (`yt-dlp`)** records completed URL markers. Continuing an interrupted job submits the first incomplete URL and anything after it.
+- **Image Capture (`gallery-dl`)** uses archive-backed retry. Continuing an interrupted image job resubmits the original URLs and lets the case archive, or the image universal archive when enabled, skip completed items.
+
+Concurrent queue behavior:
+
+- Audio/Video and Image Capture have separate concurrent-capture limits.
+- `yt-dlp` and `gallery-dl` jobs may run at the same time when their domains do not collide.
+- Same-domain concurrent jobs trigger a collision prompt so users can continue, wait, or cancel.
+
+Each recoverable job can write `manifests/gui-job-recovery-<job-id>.json` under the case folder. These files explain what the app tried to resume; they are not a replacement for the normal case manifest or review notes.
 
 ### Domain Presets, Proxy, VPN, and Archives
 
@@ -270,7 +377,7 @@ The app does not auto-update tools on launch. Updates should be used only when a
 
 ## Profiles and Settings
 
-The app stores settings beside the app in `gui-settings.json`.
+The app stores settings beside the app in `gui-settings.json`. **Job Persistence** should stay enabled if users need queue recovery or direct-capture recovery after a close or crash.
 
 Common state files:
 
