@@ -190,7 +190,7 @@ function Invoke-GalleryDlSafely {
                     $Line = $_.ToString()
                     if ($Line.Length -gt 0) {
                         Write-Host $Line
-                        Add-Content -LiteralPath $RunLog -Value $Line -Encoding UTF8
+                        Write-RunLogLineOnly $Line
                     }
                 }
             }
@@ -319,20 +319,60 @@ $UnsupportedFile = Join-Path $LogsFolder "gallery-dl-unsupported_$RunStamp.txt"
 $ManifestFile = Join-Path $ManifestsFolder "gallery-dl-sha256-manifest_$RunStamp.csv"
 $CapturedUrlsFile = Join-Path $OutputRootFull "gui-captured-urls.txt"
 $FailedUrlsFile = Join-Path $OutputRootFull "gui-failed-urls.txt"
+$script:RunLogWriter = $null
+
+function Initialize-RunLogWriter {
+    if ($null -ne $script:RunLogWriter) {
+        return
+    }
+
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    $script:RunLogWriter = New-Object System.IO.StreamWriter($RunLog, $true, $encoding)
+}
+
+function Write-RunLogLineOnly {
+    param([AllowNull()][string]$Message)
+
+    if ($null -eq $script:RunLogWriter) {
+        Initialize-RunLogWriter
+    }
+
+    if ($null -ne $script:RunLogWriter) {
+        $script:RunLogWriter.WriteLine([string]$Message)
+    }
+    else {
+        Add-Content -LiteralPath $RunLog -Value $Message -Encoding UTF8
+    }
+}
+
+function Close-RunLogWriter {
+    if ($null -ne $script:RunLogWriter) {
+        try {
+            $script:RunLogWriter.Flush()
+        }
+        finally {
+            $script:RunLogWriter.Dispose()
+            $script:RunLogWriter = $null
+        }
+    }
+}
+
+Initialize-RunLogWriter
 
 function Write-RunLog {
     param([string]$Message)
     Write-Host $Message
-    Add-Content -LiteralPath $RunLog -Value $Message -Encoding UTF8
+    Write-RunLogLineOnly $Message
 }
 
-$Urls = @()
+$UrlList = New-Object System.Collections.Generic.List[string]
 foreach ($line in Get-Content -LiteralPath $InputFile -Encoding UTF8) {
     $trimmed = $line.Trim()
     if ($trimmed -and -not $trimmed.StartsWith('#')) {
-        $Urls += $trimmed
+        [void]$UrlList.Add($trimmed)
     }
 }
+$Urls = $UrlList.ToArray()
 
 if (-not $Urls.Count) {
     throw "No URLs were found in InputFile."
@@ -408,17 +448,17 @@ function Write-GuiUrlResult {
 
     if ($Status -eq "captured") {
         $record = "{0}`tcaptured`t{1}`t{2}`t{3}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $SafeCaseName, $Url, $Detail
-        Add-Content -LiteralPath $CapturedUrlsFile -Value $record -Encoding UTF8
+        Add-BufferedGuiUrlRecord -Status "captured" -Line $record
         $marker = "GUI_QUEUE_URL_COMPLETE`t{0}`t{1}`t{2}" -f $Index, $Total, $Url
     }
     else {
         $record = "{0}`tfailed`t{1}`t{2}`t{3}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $SafeCaseName, $Url, $Detail
-        Add-Content -LiteralPath $FailedUrlsFile -Value $record -Encoding UTF8
+        Add-BufferedGuiUrlRecord -Status "failed" -Line $record
         $marker = "GUI_QUEUE_URL_INCOMPLETE`t{0}`t{1}`t{2}" -f $Index, $Total, $Url
     }
 
     Write-Host $marker
-    Add-Content -LiteralPath $RunLog -Value $marker -Encoding UTF8
+    Write-RunLogLineOnly $marker
 }
 
 function Write-Utf8NoBomLines {
@@ -451,6 +491,57 @@ function Read-UrlSetFromFile {
 
 $Completed = 0
 $Failed = 0
+$script:CapturedUrlRecords = New-Object System.Collections.Generic.List[string]
+$script:FailedUrlRecords = New-Object System.Collections.Generic.List[string]
+
+function Add-BufferedGuiUrlRecord {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet("captured", "failed")][string]$Status,
+        [Parameter(Mandatory = $true)][string]$Line
+    )
+
+    if ($Status -eq "captured") {
+        [void]$script:CapturedUrlRecords.Add($Line)
+    }
+    else {
+        [void]$script:FailedUrlRecords.Add($Line)
+    }
+}
+
+function Write-BufferedLinesUtf8NoBom {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$Lines,
+        [Parameter(Mandatory = $false)][bool]$Append = $true
+    )
+
+    if (-not $Lines -or $Lines.Count -eq 0) {
+        return
+    }
+
+    $parent = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
+        New-DirectoryIfMissing -Path $parent
+    }
+
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    $writer = New-Object System.IO.StreamWriter($Path, $Append, $encoding)
+    try {
+        foreach ($Line in $Lines) {
+            $writer.WriteLine($Line)
+        }
+    }
+    finally {
+        $writer.Dispose()
+    }
+}
+
+function Flush-GuiUrlRecords {
+    Write-BufferedLinesUtf8NoBom -Path $CapturedUrlsFile -Lines $script:CapturedUrlRecords.ToArray() -Append $true
+    Write-BufferedLinesUtf8NoBom -Path $FailedUrlsFile -Lines $script:FailedUrlRecords.ToArray() -Append $true
+    $script:CapturedUrlRecords.Clear()
+    $script:FailedUrlRecords.Clear()
+}
 
 if ($Urls.Count -gt 1) {
     Write-Section "Image URL batch"
@@ -499,7 +590,7 @@ if ($Urls.Count -gt 1) {
         $Completed = 0
         $msg = "ERROR capturing image URL batch:`r`n$($_.Exception.Message)"
         Write-Warning $msg
-        Add-Content -LiteralPath $RunLog -Value $msg -Encoding UTF8
+        Write-RunLogLineOnly $msg
 
         $Index = 0
         foreach ($Url in $Urls) {
@@ -534,7 +625,7 @@ else {
             $ExitCode = 1
             $msg = "ERROR capturing image URL $Index`: $Url`r`n$($_.Exception.Message)"
             Write-Warning $msg
-            Add-Content -LiteralPath $RunLog -Value $msg -Encoding UTF8
+            Write-RunLogLineOnly $msg
         }
 
         if ($ExitCode -eq 0) {
@@ -549,21 +640,30 @@ else {
     }
 }
 
+Flush-GuiUrlRecords
+
 Write-Section "Image Capture Manifest"
 $CaseFiles = Get-ChildItem -LiteralPath $CaseFolder -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
     $_.FullName -notlike "*\.gui-cache\*" -and $_.FullName -notlike "*\manifests\*"
 }
 
-"SHA256,SizeBytes,RelativePath" | Set-Content -LiteralPath $ManifestFile -Encoding UTF8
-foreach ($File in $CaseFiles) {
-    try {
-        $Hash = Get-Sha256HashCompat -Path $File.FullName
-        $Relative = $File.FullName.Substring($CaseFolder.Length).TrimStart('\', '/')
-        '"{0}",{1},"{2}"' -f $Hash, $File.Length, ($Relative -replace '"', '""') | Add-Content -LiteralPath $ManifestFile -Encoding UTF8
+$ManifestEncoding = New-Object System.Text.UTF8Encoding($false)
+$ManifestWriter = New-Object System.IO.StreamWriter($ManifestFile, $false, $ManifestEncoding)
+try {
+    $ManifestWriter.WriteLine("SHA256,SizeBytes,RelativePath")
+    foreach ($File in $CaseFiles) {
+        try {
+            $Hash = Get-Sha256HashCompat -Path $File.FullName
+            $Relative = $File.FullName.Substring($CaseFolder.Length).TrimStart('\', '/')
+            $ManifestWriter.WriteLine(('"{0}",{1},"{2}"' -f $Hash, $File.Length, ($Relative -replace '"', '""')))
+        }
+        catch {
+            Write-RunLog "WARNING: Could not hash file: $($File.FullName) - $($_.Exception.Message)"
+        }
     }
-    catch {
-        Write-RunLog "WARNING: Could not hash file: $($File.FullName) - $($_.Exception.Message)"
-    }
+}
+finally {
+    $ManifestWriter.Dispose()
 }
 
 Write-Section "Image Capture Summary"
@@ -572,6 +672,7 @@ Write-RunLog "Completed URLs: $Completed"
 Write-RunLog "Failed URLs: $Failed"
 Write-RunLog "Case folder: $CaseFolder"
 Write-RunLog "Manifest: $ManifestFile"
+Close-RunLogWriter
 
 if ($Failed -gt 0) {
     exit 1

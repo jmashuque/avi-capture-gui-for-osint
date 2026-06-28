@@ -389,7 +389,7 @@ Common state files:
 
 The **Default** profile loads on startup. Custom profiles can be managed from the Profile menu.
 
-`python gui.py --fresh` clears app settings/state files, app-owned temp files, URL-box persistence files, universal archives, and temporary GUI cache folders under known Output Roots. It does not delete captured case folders, media files, cookies, binaries, or scripts.
+`python gui.py --fresh` clears app settings/state files, Job Queue persistence, URL-box persistence, app-owned temp files, the app debug log, universal archives, GUI cache folders under known Output Roots, and narrow app-owned atomic write temp files. It also reads saved Job Queue state before deleting it so older job-only Output Roots can be cleaned. It does not delete captured case folders, media files, cookies, binaries, scripts, case logs, manifests, or case-specific capture archives.
 
 ## Cookies Handling
 
@@ -419,6 +419,18 @@ The app does not collect credentials or automate website logins.
 - The app is not a substitute for authorization, evidence-handling policy, or analyst judgment.
 
 ## Changelog
+
+### v1.2026.0628 - Stability, Recovery, and Large Capture Polish
+
+- Improved overall GUI responsiveness, scrolling, shutdown handling, and background task stability.
+- Improved Job Queue performance and recovery clarity, including clearer direct-capture recovery jobs, queue filtering, and better handling of interrupted work.
+- Improved large capture handling for Audio/Video and Image workflows, including more efficient logging, safer state saving, and better performance with large URL lists.
+- Improved Case Browser performance for large folders with compact list handling, safer card rendering, better scrolling, and lazy hover previews for media thumbnails.
+- Improved Audio/Video Preview behavior for large URL lists with clearer safeguards before loading heavy previews.
+- Improved `--fresh` cleanup so it removes more app-created cache, temp, debug, and stale state files without deleting captured case output.
+- Refreshed README setup, launch, recovery, and basic usage guidance for non-technical users.
+- Increased the default GUI height to better fit the current layout.
+- Cleaned up duplicated/internal GUI logic and removed Windows-irrelevant scroll handling.
 
 ### v1.2026.0626 - AVI Capture, Image Capture, and Dual-Engine Queueing
 

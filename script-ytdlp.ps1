@@ -200,6 +200,62 @@ if (-not [string]::IsNullOrWhiteSpace($ProxyUrl)) {
 }
 
 $script:RunLog = ""
+$script:RunLogWriter = $null
+
+function Initialize-RunLogWriter {
+    if ([string]::IsNullOrWhiteSpace($script:RunLog)) {
+        return
+    }
+
+    if ($null -ne $script:RunLogWriter) {
+        return
+    }
+
+    $parent = Split-Path -Parent $script:RunLog
+    if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    $script:RunLogWriter = New-Object System.IO.StreamWriter($script:RunLog, $true, $encoding)
+}
+
+function Add-RunLogLine {
+    param([AllowNull()][string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($script:RunLog)) {
+        return
+    }
+
+    if ($null -eq $script:RunLogWriter) {
+        Initialize-RunLogWriter
+    }
+
+    if ($null -ne $script:RunLogWriter) {
+        $script:RunLogWriter.WriteLine([string]$Message)
+    }
+    else {
+        Add-Content -LiteralPath $script:RunLog -Value $Message -Encoding UTF8
+    }
+}
+
+function Flush-RunLogWriter {
+    if ($null -ne $script:RunLogWriter) {
+        $script:RunLogWriter.Flush()
+    }
+}
+
+function Close-RunLogWriter {
+    if ($null -ne $script:RunLogWriter) {
+        try {
+            $script:RunLogWriter.Flush()
+        }
+        finally {
+            $script:RunLogWriter.Dispose()
+            $script:RunLogWriter = $null
+        }
+    }
+}
 
 function Write-Section {
     param([string]$Text)
@@ -215,9 +271,7 @@ function Write-RunLog {
 
     Write-Host $Message
 
-    if (-not [string]::IsNullOrWhiteSpace($script:RunLog)) {
-        Add-Content -LiteralPath $script:RunLog -Value $Message -Encoding UTF8
-    }
+    Add-RunLogLine $Message
 }
 
 function Write-RunWarning {
@@ -228,9 +282,7 @@ function Write-RunWarning {
 
     Write-Warning $Message
 
-    if (-not [string]::IsNullOrWhiteSpace($script:RunLog)) {
-        Add-Content -LiteralPath $script:RunLog -Value $Message -Encoding UTF8
-    }
+    Add-RunLogLine $Message
 }
 
 function Get-GuiCacheFileNameForPath {
@@ -418,7 +470,7 @@ function New-VideoThumbnailsForRecentCaptures {
 
     if ([string]::IsNullOrWhiteSpace($FFmpegExe) -or -not (Test-Path -LiteralPath $FFmpegExe -PathType Leaf)) {
         Write-Warning "FFmpeg was not found. Skipping GUI thumbnail generation."
-        Add-Content -LiteralPath $RunLog -Value "FFmpeg was not found. Skipping GUI thumbnail generation." -Encoding UTF8
+        Add-RunLogLine "FFmpeg was not found. Skipping GUI thumbnail generation."
         return $false
     }
 
@@ -465,7 +517,7 @@ function New-VideoThumbnailsForRecentCaptures {
                     $line = $_.ToString()
                     if ($line) {
                         Write-Host $line
-                        Add-Content -LiteralPath $RunLog -Value $line -Encoding UTF8
+                        Add-RunLogLine $line
                     }
                 }
 
@@ -473,7 +525,7 @@ function New-VideoThumbnailsForRecentCaptures {
                 $allOk = $false
                 $msg = "FFmpeg could not generate thumbnail for: $($file.FullName)"
                 Write-Warning $msg
-                Add-Content -LiteralPath $RunLog -Value $msg -Encoding UTF8
+                Add-RunLogLine $msg
                 if (Test-Path -LiteralPath $thumbPath -PathType Leaf) {
                     Remove-Item -LiteralPath $thumbPath -Force -ErrorAction SilentlyContinue
                 }
@@ -483,7 +535,7 @@ function New-VideoThumbnailsForRecentCaptures {
             $allOk = $false
             $msg = "Thumbnail generation failed for $($file.FullName): $($_.Exception.Message)"
             Write-Warning $msg
-            Add-Content -LiteralPath $RunLog -Value $msg -Encoding UTF8
+            Add-RunLogLine $msg
         }
     }
 
@@ -532,7 +584,7 @@ function New-MediaInfoForRecentCaptures {
 
     if ([string]::IsNullOrWhiteSpace($FFprobeExe) -or -not (Test-Path -LiteralPath $FFprobeExe -PathType Leaf)) {
         Write-Warning "FFprobe was not found. Skipping GUI media information generation."
-        Add-Content -LiteralPath $RunLog -Value "FFprobe was not found. Skipping GUI media information generation." -Encoding UTF8
+        Add-RunLogLine "FFprobe was not found. Skipping GUI media information generation."
         return $false
     }
 
@@ -580,14 +632,14 @@ function New-MediaInfoForRecentCaptures {
                 $allOk = $false
                 $msg = "FFprobe could not generate media info for: $($file.FullName)"
                 Write-Warning $msg
-                Add-Content -LiteralPath $RunLog -Value $msg -Encoding UTF8
+                Add-RunLogLine $msg
             }
         }
         catch {
             $allOk = $false
             $msg = "Media info generation failed for $($file.FullName): $($_.Exception.Message)"
             Write-Warning $msg
-            Add-Content -LiteralPath $RunLog -Value $msg -Encoding UTF8
+            Add-RunLogLine $msg
         }
     }
 
@@ -768,6 +820,7 @@ $GlobalFailedUrlsFile = Join-Path $OutputRoot "gui-failed-urls.txt"
 $GlobalCapturedUrlsFile = Join-Path $OutputRoot "gui-captured-urls.txt"
 $RunLog = Join-Path $LogDir ("yt-dlp-run_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 $script:RunLog = $RunLog
+Initialize-RunLogWriter
 $HashManifest = Join-Path $ManifestDir ("sha256-manifest_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 
 if ([string]::IsNullOrWhiteSpace($OutputTemplate)) {
@@ -1043,12 +1096,12 @@ Write-Host "Case:          $CaseDir"
 
 Write-Section "Version info"
 
-& $YtDlpPath --version 2>&1 | Tee-Object -FilePath $RunLog -Append
-& $DenoPath --version 2>&1 | Tee-Object -FilePath $RunLog -Append
+& $YtDlpPath --version 2>&1 | ForEach-Object { Write-RunLog ([string]$_) }
+& $DenoPath --version 2>&1 | ForEach-Object { Write-RunLog ([string]$_) }
 
 if (-not [string]::IsNullOrWhiteSpace($FFmpegFolder)) {
     $ffmpegExe = Join-Path $FFmpegFolder "ffmpeg.exe"
-    & $ffmpegExe -version 2>&1 | Select-Object -First 1 | Tee-Object -FilePath $RunLog -Append
+    & $ffmpegExe -version 2>&1 | Select-Object -First 1 | ForEach-Object { Write-RunLog ([string]$_) }
 }
 
 Write-Section "Capture options"
@@ -1100,7 +1153,7 @@ $OptionLines = @(
     "Proxy:                  $(Get-MaskedProxyUrl -Value $ProxyUrl)"
 )
 
-$OptionLines | Tee-Object -FilePath $RunLog -Append
+$OptionLines | ForEach-Object { Write-RunLog ([string]$_) }
 
 Write-Section "Loading URLs"
 
@@ -1460,7 +1513,7 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
             ForEach-Object {
                 $line = $_.ToString()
                 Write-Host $line
-                Add-Content -LiteralPath $RunLog -Value $line -Encoding UTF8
+                Add-RunLogLine $line
 
                 if ($UniversalArchiveActive) {
                     $skipArchiveId = Get-UniversalArchiveSkipArchiveIdFromLine -Line $line
@@ -1476,7 +1529,7 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
         $YtDlpExitCode = 1
         $msg = "ERROR capturing URL: $Url`r`n$($_.Exception.Message)"
         Write-Warning $msg
-        Add-Content -LiteralPath $RunLog -Value $msg -Encoding UTF8
+        Add-RunLogLine $msg
     }
     finally {
         $ErrorActionPreference = $PreviousErrorActionPreference
@@ -1520,7 +1573,7 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
     if ($YtDlpExitCode -ne 0) {
         $msg = "yt-dlp exited with code $YtDlpExitCode for URL: $Url"
         Write-Warning $msg
-        Add-Content -LiteralPath $RunLog -Value $msg -Encoding UTF8
+        Add-RunLogLine $msg
 
         if ($FailureHandling -eq "Stop") {
             Write-Warning "Stopping capture because FailureHandling is set to Stop."
@@ -1562,32 +1615,41 @@ if ($UniversalArchiveActive) {
 Write-Section "Hashing captured files"
 
 $manifestSince = if ($ManifestMode -eq "RunOnly") { $RunStartTime } else { [datetime]::MinValue }
+$manifestEncoding = New-Object System.Text.UTF8Encoding($false)
+$manifestWriter = New-Object System.IO.StreamWriter($HashManifest, $false, $manifestEncoding)
+try {
+    $manifestWriter.WriteLine('"Algorithm","Hash","Path"')
 
-$manifestRows = foreach ($file in Get-ChildItem $CaseDir -Recurse -File) {
-    if ($file.FullName -eq $HashManifest) {
-        continue
-    }
+    foreach ($file in Get-ChildItem -LiteralPath $CaseDir -Recurse -File -ErrorAction SilentlyContinue) {
+        if ($file.FullName -eq $HashManifest) {
+            continue
+        }
 
-    if ($file.FullName -like "*\.gui-cache\*") {
-        continue
-    }
+        if ($file.FullName -like "*\.gui-cache\*") {
+            continue
+        }
 
-    if ($file.FullName -like "*\manifests\*") {
-        continue
-    }
+        if ($file.FullName -like "*\manifests\*") {
+            continue
+        }
 
-    if ($file.LastWriteTime -lt $manifestSince) {
-        continue
-    }
+        if ($file.LastWriteTime -lt $manifestSince) {
+            continue
+        }
 
-    [PSCustomObject]@{
-        Algorithm = "SHA256"
-        Hash      = Get-Sha256HashCompat -Path $file.FullName
-        Path      = $file.FullName
+        try {
+            $hash = Get-Sha256HashCompat -Path $file.FullName
+            $safePath = $file.FullName -replace '"', '""'
+            $manifestWriter.WriteLine(('"SHA256","{0}","{1}"' -f $hash, $safePath))
+        }
+        catch {
+            Write-RunWarning "Could not hash file for manifest: $($file.FullName) - $($_.Exception.Message)"
+        }
     }
 }
-
-$manifestRows | Export-Csv $HashManifest -NoTypeInformation
+finally {
+    $manifestWriter.Dispose()
+}
 
 Write-RunLog "Hash manifest written to: $HashManifest"
 
@@ -1600,3 +1662,4 @@ Write-RunLog "Universal archive: $UniversalArchiveFile"
 Write-RunLog "Failed URLs:      $GlobalFailedUrlsFile"
 Write-RunLog "Captured URLs:    $GlobalCapturedUrlsFile"
 Write-RunLog "SHA256 manifest:  $HashManifest"
+Close-RunLogWriter

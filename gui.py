@@ -1,6 +1,7 @@
 import base64
 import calendar
 import csv
+import fnmatch
 import hashlib
 import html
 import hmac
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import traceback
 import urllib.request
 from urllib.parse import quote, urlsplit, urlunsplit
 from pathlib import Path
@@ -27,10 +29,10 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 
 APP_TITLE = "AVI Capture GUI for OSINT"
-APP_VERSION = "v1.2026.0626"
+APP_VERSION = "v1.2026.0628"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/avi-capture-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
-APP_WINDOW_DEFAULT_HEIGHT = 960
+APP_WINDOW_DEFAULT_HEIGHT = 980
 APP_WINDOW_MIN_WIDTH = 1050
 APP_WINDOW_MIN_HEIGHT = 840
 APP_WINDOW_SCREEN_MARGIN_WIDTH = 80
@@ -49,6 +51,7 @@ IMAGE_URL_BOX_PERSISTENCE_FILE = os.path.join(ROOT, "gui-image-url-box.txt")
 UNIVERSAL_ARCHIVE_FILE = os.path.join(ROOT, "universal-download-archive.txt")
 IMAGE_UNIVERSAL_ARCHIVE_FILE = os.path.join(ROOT, "universal-gallerydl-archive.sqlite3")
 GUI_TEMP_DIR = os.path.join(ROOT, "gui-temp")
+DEBUG_LOG_FILE = os.path.join(ROOT, "gui-debug.log")
 JOBS_FILE_VERSION = 2
 DEFAULT_PROFILE_NAME = "Default"
 
@@ -279,6 +282,13 @@ job_queue_current_job_id = None
 job_queue_running_processes = {}
 job_queue_run_filter_ids = None
 job_queue_state_loading = False
+job_queue_save_after_id = None
+job_queue_filter_var = None
+job_queue_summary_var = None
+job_queue_visible_count_var = None
+job_queue_recovery_banner_frame = None
+job_queue_recovery_banner_var = None
+job_queue_row_cache = {}
 url_view_mode = "all"
 url_all_view_cache = []
 domain_preset_window = None
@@ -291,14 +301,44 @@ playlist_preview_candidate_urls = []
 playlist_preview_source_signature = ""
 playlist_preview_loaded_signature = ""
 playlist_preview_tab_loaded = False
+playlist_preview_full_load_approved_signature = ""
+playlist_preview_url_limit_once = 0
 url_preview_pending_playlist_name = ""
 url_box_autoload_ready = False
+APP_CLOSING = False
+SHUTDOWN_STARTED = False
+STARTUP_INTERRUPTED_PROMPT_SHOWN = False
+DEBUG_LOG_LOCK = threading.Lock()
+THEME_SKIP_CHILDREN_ATTR = "_avi_capture_skip_theme_children"
 
 FRESH_STARTUP_MESSAGES = []
 
 
 def fresh_arg_requested():
     return any(str(arg).strip().lower() == "--fresh" for arg in sys.argv[1:])
+
+
+def fresh_normalize_path(value):
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    try:
+        return os.path.abspath(os.path.expandvars(os.path.expanduser(value)))
+    except Exception:
+        return ""
+
+
+def fresh_add_output_root(output_roots, value):
+    normalized = fresh_normalize_path(value)
+    if normalized:
+        output_roots.add(normalized)
+
+
+def fresh_add_output_roots_from_settings(output_roots, settings):
+    if not isinstance(settings, dict):
+        return
+    fresh_add_output_root(output_roots, settings.get("output_root"))
+    fresh_add_output_root(output_roots, settings.get("image_output_root"))
 
 
 def collect_fresh_output_roots_from_settings():
@@ -313,36 +353,152 @@ def collect_fresh_output_roots_from_settings():
     except Exception:
         return sorted(output_roots)
 
-    def add_output_root(value):
-        value = str(value or "").strip()
-        if not value:
-            return
-
-        try:
-            output_roots.add(os.path.abspath(os.path.expandvars(os.path.expanduser(value))))
-        except Exception:
-            pass
-
-    def add_output_roots_from_settings(settings):
-        if not isinstance(settings, dict):
-            return
-        add_output_root(settings.get("output_root"))
-        add_output_root(settings.get("image_output_root"))
-
     if isinstance(raw, dict):
         profiles = raw.get("profiles", {})
         if isinstance(profiles, dict):
             for profile_settings in profiles.values():
-                add_output_roots_from_settings(profile_settings)
+                fresh_add_output_roots_from_settings(output_roots, profile_settings)
 
-        add_output_roots_from_settings(raw)
+        fresh_add_output_roots_from_settings(output_roots, raw)
 
     return sorted(output_roots)
 
 
+def collect_fresh_output_roots_from_jobs():
+    output_roots = set()
+
+    if not os.path.isfile(JOBS_FILE):
+        return []
+
+    try:
+        with open(JOBS_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return []
+
+    raw_jobs = payload.get("jobs", []) if isinstance(payload, dict) else []
+    if not isinstance(raw_jobs, list):
+        return []
+
+    for job in raw_jobs:
+        if not isinstance(job, dict):
+            continue
+        fresh_add_output_root(output_roots, job.get("output_root"))
+        settings = job.get("settings", {})
+        if isinstance(settings, dict):
+            fresh_add_output_roots_from_settings(output_roots, settings)
+
+    return sorted(output_roots)
+
+
+def collect_fresh_output_roots():
+    output_roots = set()
+    output_roots.update(collect_fresh_output_roots_from_settings())
+    output_roots.update(collect_fresh_output_roots_from_jobs())
+    output_roots.add(os.path.abspath(os.path.join(ROOT, "Investigations")))
+    return sorted(path for path in output_roots if path)
+
+
+def fresh_path_is_filesystem_root(path):
+    try:
+        normalized = os.path.abspath(path).rstrip("\\/")
+    except Exception:
+        return True
+
+    drive, tail = os.path.splitdrive(normalized)
+    if drive and not tail:
+        return True
+    if drive and tail in ("\\", "/"):
+        return True
+    if normalized in (os.path.sep, ""):
+        return True
+
+    # UNC share roots such as \\server\share should not be recursively scanned.
+    if normalized.startswith("\\\\"):
+        parts = [part for part in normalized.strip("\\").split("\\") if part]
+        if len(parts) <= 2:
+            return True
+
+    return False
+
+
+def fresh_safe_recursive_cache_root(path):
+    normalized = fresh_normalize_path(path)
+    if not normalized or fresh_path_is_filesystem_root(normalized):
+        return ""
+    return normalized
+
+
+def collect_fresh_nested_gui_cache_dirs(output_roots):
+    cache_dirs = []
+    seen = set()
+
+    for output_root in output_roots:
+        root_path = fresh_safe_recursive_cache_root(output_root)
+        if not root_path or not os.path.isdir(root_path):
+            continue
+
+        for current_root, dir_names, _file_names in os.walk(root_path):
+            if ".gui-cache" in dir_names:
+                cache_path = os.path.abspath(os.path.join(current_root, ".gui-cache"))
+                if cache_path not in seen:
+                    seen.add(cache_path)
+                    cache_dirs.append(cache_path)
+                # Do not walk inside a cache folder that is about to be deleted.
+                try:
+                    dir_names.remove(".gui-cache")
+                except ValueError:
+                    pass
+
+    return cache_dirs
+
+
+def collect_fresh_atomic_temp_files(output_roots):
+    temp_files = []
+    seen = set()
+
+    def add_if_match(folder, filename, patterns):
+        path = os.path.abspath(os.path.join(folder, filename))
+        if path in seen:
+            return
+        if any(fnmatch.fnmatch(filename, pattern) for pattern in patterns):
+            if os.path.isfile(path):
+                seen.add(path)
+                temp_files.append(path)
+
+    root_patterns = [
+        ".gui-settings.json.*.tmp",
+        ".gui-jobs.json.*.tmp",
+    ]
+    try:
+        for filename in os.listdir(ROOT):
+            add_if_match(ROOT, filename, root_patterns)
+    except Exception:
+        pass
+
+    recovery_patterns = [".gui-job-recovery-*.json.*.tmp"]
+    for output_root in output_roots:
+        root_path = fresh_safe_recursive_cache_root(output_root)
+        if not root_path or not os.path.isdir(root_path):
+            continue
+        for current_root, dir_names, file_names in os.walk(root_path):
+            # Atomic temp cleanup is intentionally narrow. Skip cache folders
+            # because they are removed separately and do not need walking.
+            if ".gui-cache" in dir_names:
+                try:
+                    dir_names.remove(".gui-cache")
+                except ValueError:
+                    pass
+            for filename in file_names:
+                add_if_match(current_root, filename, recovery_patterns)
+
+    return temp_files
+
 def run_fresh_startup_cleanup_if_requested():
     if not fresh_arg_requested():
         return []
+
+    output_roots = collect_fresh_output_roots()
 
     file_targets = [
         SETTINGS_FILE,
@@ -351,18 +507,27 @@ def run_fresh_startup_cleanup_if_requested():
         IMAGE_URL_BOX_PERSISTENCE_FILE,
         UNIVERSAL_ARCHIVE_FILE,
         IMAGE_UNIVERSAL_ARCHIVE_FILE,
+        DEBUG_LOG_FILE,
     ]
-    dir_targets = [GUI_TEMP_DIR]
+    file_targets.extend(collect_fresh_atomic_temp_files(output_roots))
 
-    for output_root in collect_fresh_output_roots_from_settings():
+    dir_targets = [
+        GUI_TEMP_DIR,
+        os.path.join(ROOT, ".gui-cache"),
+    ]
+
+    for output_root in output_roots:
         file_targets.append(os.path.join(output_root, "gui-captured-urls.txt"))
         file_targets.append(os.path.join(output_root, "gui-failed-urls.txt"))
         dir_targets.append(os.path.join(output_root, ".gui-cache"))
+
+    dir_targets.extend(collect_fresh_nested_gui_cache_dirs(output_roots))
 
     seen = set()
     deleted_files = []
     deleted_dirs = []
     failed = []
+    skipped = []
 
     for target in file_targets:
         try:
@@ -387,7 +552,9 @@ def run_fresh_startup_cleanup_if_requested():
         except Exception as e:
             failed.append((normalized, str(e)))
 
-    for target in dir_targets:
+    # Delete deeper cache folders before their parents.
+    sorted_dir_targets = sorted(dir_targets, key=lambda p: len(str(p)), reverse=True)
+    for target in sorted_dir_targets:
         try:
             normalized = os.path.abspath(target)
         except Exception:
@@ -402,6 +569,15 @@ def run_fresh_startup_cleanup_if_requested():
 
         if not os.path.isdir(normalized):
             failed.append((normalized, "not a directory"))
+            continue
+
+        basename = os.path.basename(normalized.rstrip("\\/"))
+        if basename != ".gui-cache" and normalized not in {os.path.abspath(GUI_TEMP_DIR)}:
+            skipped.append((normalized, "not an app-owned cache/temp folder"))
+            continue
+
+        if basename == ".gui-cache" and fresh_path_is_filesystem_root(os.path.dirname(normalized)):
+            skipped.append((normalized, "refusing to delete cache folder directly under a filesystem root"))
             continue
 
         try:
@@ -423,12 +599,16 @@ def run_fresh_startup_cleanup_if_requested():
         messages.append("Deleted cache/temp folders:")
         messages.extend(f"- {path}" for path in deleted_dirs)
 
+    if skipped:
+        messages.append("Skipped:")
+        messages.extend(f"- {path}: {reason}" for path, reason in skipped)
+
     if failed:
         messages.append("Failed:")
         messages.extend(f"- {path}: {error}" for path, error in failed)
 
-    if not deleted_files and not deleted_dirs and not failed:
-        messages.append("No existing settings/jobs/captured/failed files, app temp folder, or output-root cache folders were found to delete.")
+    if not deleted_files and not deleted_dirs and not failed and not skipped:
+        messages.append("No existing settings/jobs/captured/failed files, debug log, app temp folder, app-owned atomic temp files, or GUI cache folders were found to delete.")
 
     return messages
 
@@ -438,6 +618,256 @@ FRESH_STARTUP_MESSAGES = run_fresh_startup_cleanup_if_requested()
 
 CASE_BROWSER_TREE_BATCH_SIZE = 75
 CASE_BROWSER_CARD_BATCH_SIZE = 24
+CASE_BROWSER_UI_CALLBACKS_PER_TICK = 50
+CASE_BROWSER_CARD_INITIAL_LIMIT = 120
+CASE_BROWSER_COMPACT_AUTO_THRESHOLD = 300
+CASE_BROWSER_HUGE_SUMMARY_THRESHOLD = 5000
+CASE_BROWSER_MAX_MEDIA_CARD_ASSETS = 120
+CASE_BROWSER_MEDIA_PROBE_CONCURRENCY = 4
+CASE_BROWSER_PHOTOIMAGE_REF_LIMIT = 180
+CASE_BROWSER_COMPACT_PREVIEW_DELAY_MS = 600
+CASE_BROWSER_COMPACT_PREVIEW_MAX_WIDTH = 320
+CASE_BROWSER_COMPACT_PREVIEW_MAX_HEIGHT = 240
+CASE_BROWSER_COMPACT_PREVIEW_WRAP = 460
+GUI_LOG_FLUSH_INTERVAL_MS = 75
+GUI_LOG_FLUSH_MAX_ITEMS = 300
+GUI_LOG_FLUSH_MAX_CHARS = 120_000
+GUI_LOG_MAX_VISIBLE_LINES = 10_000
+URL_BOX_AUTOPREVIEW_DEBOUNCE_MS = 650
+URL_BOX_LARGE_AUTOPREVIEW_DEBOUNCE_MS = 1200
+URL_BOX_LARGE_AUTOPREVIEW_LINE_THRESHOLD = 500
+URL_PREVIEW_LARGE_LIST_GUARD_THRESHOLD = 500
+URL_PREVIEW_HUGE_LIST_GUARD_THRESHOLD = 1000
+URL_PREVIEW_FIRST_SAMPLE_COUNT = 25
+SETTINGS_AUTOSAVE_DELAY_MS = 800
+JOB_QUEUE_SAVE_DELAY_MS = 600
+JOB_QUEUE_FILTER_OPTIONS = ["All", "Running", "Pending", "Interrupted", "Failed", "Completed", "Cancelled", "Checked", "Incomplete"]
+main_log_queue = queue.Queue()
+image_log_queue = queue.Queue()
+main_log_flush_after_id = None
+image_log_flush_after_id = None
+settings_autosave_after_id = None
+case_browser_media_probe_semaphore = threading.BoundedSemaphore(CASE_BROWSER_MEDIA_PROBE_CONCURRENCY)
+
+
+def log_debug_exception(context, exc=None):
+    """Write suppressed GUI/thread errors to an app-local debug log."""
+    try:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        context_text = str(context or "unknown context")
+        if exc is None:
+            detail = "".join(traceback.format_stack(limit=8))
+        else:
+            detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+        os.makedirs(ROOT, exist_ok=True)
+        with DEBUG_LOG_LOCK:
+            with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"[{timestamp}] {context_text}\n")
+                f.write(detail.rstrip() + "\n\n")
+    except Exception:
+        # Debug logging must never become a new crash source.
+        pass
+
+
+def run_safe_ui_callback(callback, callback_args=()):
+    if APP_CLOSING:
+        return
+
+    try:
+        callback(*(callback_args or ()))
+    except tk.TclError as e:
+        log_debug_exception(f"Tk callback failed after UI changed: {getattr(callback, '__name__', repr(callback))}", e)
+    except Exception as e:
+        log_debug_exception(f"Tk callback failed: {getattr(callback, '__name__', repr(callback))}", e)
+
+
+def start_daemon_thread(name, target, *args, **kwargs):
+    """Start a daemon worker with common exception logging and shutdown awareness."""
+    def runner():
+        if APP_CLOSING:
+            return
+        try:
+            target(*args, **kwargs)
+        except Exception as e:
+            log_debug_exception(f"Worker thread failed: {name}", e)
+            try:
+                queue_append_log(f"\nBackground worker failed ({name}). Details were written to gui-debug.log.\n")
+            except Exception:
+                pass
+
+    try:
+        thread = threading.Thread(target=runner, name=str(name or "worker"), daemon=True)
+        thread.start()
+        return thread
+    except Exception as e:
+        log_debug_exception(f"Could not start worker thread: {name}", e)
+        return None
+
+
+def widget_exists(widget):
+    try:
+        return bool(widget and widget.winfo_exists())
+    except Exception:
+        return False
+
+
+def safe_after(delay_ms, callback=None, *args):
+    """Schedule a Tk callback only while the main window is alive.
+
+    Worker threads can still finish while the app is closing. Centralizing Tk
+    scheduling prevents late callbacks from touching a destroyed interpreter.
+    """
+    if APP_CLOSING:
+        return None
+
+    try:
+        app_root = root
+    except NameError:
+        return None
+
+    try:
+        if not app_root.winfo_exists():
+            return None
+        if callback is None:
+            return app_root.after(delay_ms)
+        return app_root.after(delay_ms, run_safe_ui_callback, callback, args)
+    except tk.TclError as e:
+        log_debug_exception("safe_after could not schedule callback", e)
+        return None
+    except RuntimeError as e:
+        log_debug_exception("safe_after runtime failure", e)
+        return None
+    except Exception as e:
+        log_debug_exception("safe_after unexpected failure", e)
+        return None
+
+
+def get_widget_parent(widget):
+    try:
+        parent_name = widget.winfo_parent()
+        if not parent_name:
+            return None
+        return widget.nametowidget(parent_name)
+    except Exception:
+        return None
+
+
+def get_scroll_view(widget, axis):
+    try:
+        view_func = widget.xview if axis == "x" else widget.yview
+    except Exception:
+        return None
+
+    try:
+        view = view_func()
+    except Exception:
+        return None
+
+    if not isinstance(view, tuple) or len(view) < 2:
+        return None
+
+    try:
+        return float(view[0]), float(view[1])
+    except Exception:
+        return None
+
+
+def can_scroll_widget(widget, axis, direction):
+    view = get_scroll_view(widget, axis)
+    if not view:
+        return False
+
+    first, last = view
+    if first <= 0.001 and last >= 0.999:
+        return False
+
+    if direction < 0:
+        return first > 0.001
+    if direction > 0:
+        return last < 0.999
+    return False
+
+
+def find_scroll_target(widget, axis, direction):
+    current = widget
+    while current is not None:
+        if can_scroll_widget(current, axis, direction):
+            return current
+        current = get_widget_parent(current)
+    return None
+
+
+def wheel_event_units(event):
+    """Return Windows Tk mouse-wheel scroll units for the portable GUI."""
+    delta = getattr(event, "delta", 0)
+    if not delta:
+        return 0
+    steps = max(1, abs(int(delta / 120)))
+    return -steps if delta > 0 else steps
+
+
+def handle_bound_mousewheel(event):
+    axis = "x" if (getattr(event, "state", 0) & 0x0001) else "y"
+    units = wheel_event_units(event)
+    if not units:
+        return None
+
+    target = find_scroll_target(event.widget, axis, units)
+    if target is None:
+        return None
+
+    try:
+        if axis == "x":
+            target.xview_scroll(units, "units")
+        else:
+            target.yview_scroll(units, "units")
+        return "break"
+    except Exception:
+        return None
+
+
+def bind_widget_scroll_events(widget):
+    try:
+        if getattr(widget, "_avi_scroll_events_bound", False):
+            return
+        # Windows Tk uses <MouseWheel>. Shift state is handled in
+        # handle_bound_mousewheel so Shift+wheel scrolls horizontally.
+        widget.bind("<MouseWheel>", handle_bound_mousewheel, add="+")
+        widget.bind("<Shift-MouseWheel>", handle_bound_mousewheel, add="+")
+        widget._avi_scroll_events_bound = True
+    except Exception as exc:
+        log_debug_exception(f"Binding scroll events on {type(widget).__name__}", exc)
+def bind_widget_tree_scroll_events(widget):
+    bind_widget_scroll_events(widget)
+    try:
+        children = widget.winfo_children()
+    except Exception:
+        return
+
+    for child in children:
+        bind_widget_tree_scroll_events(child)
+
+
+def install_global_scroll_recognition(root_widget):
+    """Make wheel/trackpad scrolling follow the widget under the pointer.
+
+    Tkinter's default wheel behavior depends heavily on focus and widget class.
+    This app has many nested Treeview/Text/Listbox/Canvas areas, so binding on
+    entry and walking upward to the nearest scrollable parent gives predictable
+    scrolling for both direct widgets and canvas-backed child frames.
+    """
+    def bind_entered_widget(event):
+        bind_widget_scroll_events(event.widget)
+
+    try:
+        if not getattr(root_widget, "_avi_global_scroll_recognition_installed", False):
+            root_widget.bind_all("<Enter>", bind_entered_widget, add="+")
+            root_widget._avi_global_scroll_recognition_installed = True
+    except Exception:
+        pass
+
+    bind_widget_tree_scroll_events(root_widget)
 
 
 def join_input_file_paths(paths):
@@ -445,21 +875,29 @@ def join_input_file_paths(paths):
     return "; ".join(clean_paths)
 
 
-def parse_input_file_paths(value=None):
-    raw = input_file_var.get() if value is None else value
-    raw = str(raw or "").strip()
+def parse_delimited_file_paths(raw):
+    """Parse visible Input File fields used by both capture engines.
 
+    Saved settings from earlier builds may contain one path, semicolon-separated
+    paths, or newline-separated paths. Keeping this in one helper prevents the
+    Audio/Video and Image Capture tabs from drifting apart again.
+    """
+    raw = str(raw or "").strip()
     if not raw:
         return []
+    return [part.strip().strip('"') for part in re.split(r"[;\n]+", raw) if part.strip()]
 
-    # Existing single-file settings remain valid. Multiple selections are stored
-    # as semicolon-separated paths in the visible Input File field.
-    parts = [part.strip().strip('"') for part in re.split(r"[;\n]+", raw) if part.strip()]
-    return parts
+
+def existing_file_paths(paths):
+    return [path for path in (paths or []) if os.path.isfile(path)]
+
+
+def parse_input_file_paths(value=None):
+    return parse_delimited_file_paths(input_file_var.get() if value is None else value)
 
 
 def get_existing_input_file_paths(value=None):
-    return [path for path in parse_input_file_paths(value) if os.path.isfile(path)]
+    return existing_file_paths(parse_input_file_paths(value))
 
 
 def describe_input_file_paths(paths=None):
@@ -499,9 +937,134 @@ def browse_folder(var, title="Select folder"):
         var.set(path)
 
 
+def append_to_log_widget(widget, text):
+    text = str(text or "")
+    if not text:
+        return
+
+    try:
+        widget.insert("end", text)
+        try:
+            line_count = int(float(widget.index("end-1c")))
+        except Exception:
+            line_count = 0
+
+        if line_count > GUI_LOG_MAX_VISIBLE_LINES:
+            excess = line_count - GUI_LOG_MAX_VISIBLE_LINES
+            try:
+                widget.delete("1.0", f"{excess + 1}.0")
+            except Exception:
+                pass
+
+        widget.see("end")
+    except Exception:
+        pass
+
+
 def append_log(text):
-    log_box.insert("end", text)
-    log_box.see("end")
+    append_to_log_widget(log_box, text)
+
+
+def collect_log_queue_text(log_queue):
+    chunks = []
+    total_chars = 0
+    total_items = 0
+
+    while total_items < GUI_LOG_FLUSH_MAX_ITEMS and total_chars < GUI_LOG_FLUSH_MAX_CHARS:
+        try:
+            chunk = log_queue.get_nowait()
+        except queue.Empty:
+            break
+        except Exception:
+            break
+
+        chunk = str(chunk or "")
+        if not chunk:
+            continue
+
+        chunks.append(chunk)
+        total_chars += len(chunk)
+        total_items += 1
+
+    return "".join(chunks)
+
+
+def flush_named_log_queue(log_queue, append_func, reschedule_func):
+    text = collect_log_queue_text(log_queue)
+    if text:
+        append_func(text)
+
+    try:
+        if not log_queue.empty():
+            reschedule_func()
+    except Exception:
+        pass
+
+
+def schedule_named_log_flush(log_queue, flush_func, after_id_getter, after_id_setter, text, fallback_append_func, debug_label):
+    try:
+        log_queue.put(str(text or ""))
+        if after_id_getter() is None:
+            after_id_setter(safe_after(GUI_LOG_FLUSH_INTERVAL_MS, flush_func))
+    except Exception as e:
+        log_debug_exception(f"{debug_label} failed", e)
+        safe_after(0, fallback_append_func, text)
+
+
+def flush_main_log_queue():
+    global main_log_flush_after_id
+
+    main_log_flush_after_id = None
+    flush_named_log_queue(
+        main_log_queue,
+        append_log,
+        lambda: set_main_log_flush_after_id(safe_after(GUI_LOG_FLUSH_INTERVAL_MS, flush_main_log_queue)),
+    )
+
+
+def set_main_log_flush_after_id(value):
+    global main_log_flush_after_id
+    main_log_flush_after_id = value
+
+
+def queue_append_log(text):
+    schedule_named_log_flush(
+        main_log_queue,
+        flush_main_log_queue,
+        lambda: main_log_flush_after_id,
+        set_main_log_flush_after_id,
+        text,
+        append_log,
+        "queue_append_log",
+    )
+
+
+def flush_image_log_queue():
+    global image_log_flush_after_id
+
+    image_log_flush_after_id = None
+    flush_named_log_queue(
+        image_log_queue,
+        image_append_log,
+        lambda: set_image_log_flush_after_id(safe_after(GUI_LOG_FLUSH_INTERVAL_MS, flush_image_log_queue)),
+    )
+
+
+def set_image_log_flush_after_id(value):
+    global image_log_flush_after_id
+    image_log_flush_after_id = value
+
+
+def queue_image_append_log(text):
+    schedule_named_log_flush(
+        image_log_queue,
+        flush_image_log_queue,
+        lambda: image_log_flush_after_id,
+        set_image_log_flush_after_id,
+        text,
+        image_append_log,
+        "queue_image_append_log",
+    )
 
 
 def set_status(text):
@@ -549,6 +1112,13 @@ def get_theme_colors():
     }
 
 
+def mark_theme_dynamic_container(widget):
+    try:
+        setattr(widget, THEME_SKIP_CHILDREN_ATTR, True)
+    except Exception:
+        pass
+
+
 def configure_tk_widget_theme(widget, colors):
     try:
         widget_class = widget.winfo_class()
@@ -591,6 +1161,12 @@ def configure_tk_widget_theme(widget, colors):
                 activebackground=colors["select_bg"],
                 activeforeground=colors["select_fg"],
             )
+    except Exception:
+        pass
+
+    try:
+        if bool(getattr(widget, THEME_SKIP_CHILDREN_ATTR, False)):
+            return
     except Exception:
         pass
 
@@ -2067,28 +2643,24 @@ def append_urls_from_input_file():
         append_log(f"\nLoaded URLs from input file(s) and appended them to the URL box:\n{path}\n")
 
 
-def url_box_text_is_empty():
+def url_text_widget_is_empty(widget):
     try:
-        return not normalize_url_box_text_block(urls_text.get("1.0", "end"))
+        return not normalize_url_box_text_block(widget.get("1.0", "end"))
     except Exception:
         return True
 
 
-def set_url_box_text_silent(content):
+def set_url_text_widget_silent(widget, content):
     content = normalize_url_box_text_block(content)
-    urls_text.delete("1.0", "end")
-    if content:
-        urls_text.insert("1.0", content)
+    replace_text_widget_content(widget, content)
 
     try:
-        urls_text.edit_modified(False)
+        widget.edit_modified(False)
     except Exception:
         pass
 
 
-def read_valid_input_files_for_url_box_silent():
-    paths = get_existing_input_file_paths()
-
+def read_valid_input_files_for_url_box_paths(paths):
     if not paths:
         return "", ""
 
@@ -2111,37 +2683,57 @@ def read_valid_input_files_for_url_box_silent():
     return combined, describe_input_file_paths(readable_paths)
 
 
-def load_url_box_persistence_if_enabled():
+def load_url_box_persistence_file(path, set_func, log_func, label):
     if not url_box_persistence_var.get():
         return False
 
-    if not os.path.isfile(URL_BOX_PERSISTENCE_FILE):
+    if not os.path.isfile(path):
         return False
 
     try:
-        content = Path(URL_BOX_PERSISTENCE_FILE).read_text(encoding="utf-8-sig")
-        set_url_box_text_silent(content)
+        content = Path(path).read_text(encoding="utf-8-sig")
+        set_func(content)
         return True
     except Exception as e:
         try:
-            append_log(f"\nWARNING: Could not load URL Box Persistence file:\n{URL_BOX_PERSISTENCE_FILE}\n{e}\n")
+            log_func(f"\nWARNING: Could not load {label} Persistence file:\n{path}\n{e}\n")
         except Exception:
             pass
         return False
 
 
-def save_url_box_persistence_if_enabled():
+def save_url_box_persistence_file(path, widget, log_func, label):
     if not url_box_persistence_var.get():
         return
 
     try:
-        content = urls_text.get("1.0", "end-1c").replace("\r\n", "\n").replace("\r", "\n")
-        Path(URL_BOX_PERSISTENCE_FILE).write_text(content, encoding="utf-8")
+        content = widget.get("1.0", "end-1c").replace("\r\n", "\n").replace("\r", "\n")
+        Path(path).write_text(content, encoding="utf-8")
     except Exception as e:
         try:
-            append_log(f"\nWARNING: Could not save URL Box Persistence file:\n{URL_BOX_PERSISTENCE_FILE}\n{e}\n")
+            log_func(f"\nWARNING: Could not save {label} Persistence file:\n{path}\n{e}\n")
         except Exception:
             pass
+
+
+def url_box_text_is_empty():
+    return url_text_widget_is_empty(urls_text)
+
+
+def set_url_box_text_silent(content):
+    set_url_text_widget_silent(urls_text, content)
+
+
+def read_valid_input_files_for_url_box_silent():
+    return read_valid_input_files_for_url_box_paths(get_existing_input_file_paths())
+
+
+def load_url_box_persistence_if_enabled():
+    return load_url_box_persistence_file(URL_BOX_PERSISTENCE_FILE, set_url_box_text_silent, append_log, "URL Box")
+
+
+def save_url_box_persistence_if_enabled():
+    save_url_box_persistence_file(URL_BOX_PERSISTENCE_FILE, urls_text, append_log, "URL Box")
 
 
 def auto_populate_url_box_from_input_files_if_empty():
@@ -2182,80 +2774,23 @@ def handle_input_file_var_changed(*args):
 
 
 def image_url_box_text_is_empty():
-    try:
-        return not normalize_url_box_text_block(image_urls_text.get("1.0", "end"))
-    except Exception:
-        return True
+    return url_text_widget_is_empty(image_urls_text)
 
 
 def set_image_url_box_text_silent(content):
-    content = normalize_url_box_text_block(content)
-    image_urls_text.delete("1.0", "end")
-    if content:
-        image_urls_text.insert("1.0", content)
-
-    try:
-        image_urls_text.edit_modified(False)
-    except Exception:
-        pass
+    set_url_text_widget_silent(image_urls_text, content)
 
 
 def load_image_url_box_persistence_if_enabled():
-    if not url_box_persistence_var.get():
-        return False
-
-    if not os.path.isfile(IMAGE_URL_BOX_PERSISTENCE_FILE):
-        return False
-
-    try:
-        content = Path(IMAGE_URL_BOX_PERSISTENCE_FILE).read_text(encoding="utf-8-sig")
-        set_image_url_box_text_silent(content)
-        return True
-    except Exception as e:
-        try:
-            image_append_log(f"\nWARNING: Could not load Image URL Box Persistence file:\n{IMAGE_URL_BOX_PERSISTENCE_FILE}\n{e}\n")
-        except Exception:
-            pass
-        return False
+    return load_url_box_persistence_file(IMAGE_URL_BOX_PERSISTENCE_FILE, set_image_url_box_text_silent, image_append_log, "Image URL Box")
 
 
 def save_image_url_box_persistence_if_enabled():
-    if not url_box_persistence_var.get():
-        return
-
-    try:
-        content = image_urls_text.get("1.0", "end-1c").replace("\r\n", "\n").replace("\r", "\n")
-        Path(IMAGE_URL_BOX_PERSISTENCE_FILE).write_text(content, encoding="utf-8")
-    except Exception as e:
-        try:
-            image_append_log(f"\nWARNING: Could not save Image URL Box Persistence file:\n{IMAGE_URL_BOX_PERSISTENCE_FILE}\n{e}\n")
-        except Exception:
-            pass
+    save_url_box_persistence_file(IMAGE_URL_BOX_PERSISTENCE_FILE, image_urls_text, image_append_log, "Image URL Box")
 
 
 def read_valid_image_input_files_for_url_box_silent():
-    paths = get_existing_image_input_file_paths()
-
-    if not paths:
-        return "", ""
-
-    contents = []
-    readable_paths = []
-
-    for path in paths:
-        content = normalize_url_box_text_block(read_text_file_best_effort(path, log_errors=False))
-        if not content:
-            continue
-
-        contents.append(content)
-        readable_paths.append(path)
-
-    combined = normalize_url_box_text_block("\n".join(contents))
-
-    if not combined or not extract_urls_from_text(combined):
-        return "", describe_input_file_paths(readable_paths or paths)
-
-    return combined, describe_input_file_paths(readable_paths)
+    return read_valid_input_files_for_url_box_paths(get_existing_image_input_file_paths())
 
 
 def auto_populate_image_url_box_from_input_files_if_empty():
@@ -2336,39 +2871,14 @@ def clear_urls():
 
 
 def strip_url_extra_ampersand_tags():
-    content = urls_text.get("1.0", "end").strip()
+    content = get_text_widget_content(urls_text, "end", strip=True)
 
     if not content:
         messagebox.showwarning("No URLs", "The URL box is empty.")
         return
 
-    output_lines = []
-    changed = 0
-    parameter_pattern = re.compile(r"&[A-Za-z][A-Za-z0-9_-]*=")
-
-    for line in content.splitlines():
-        original_line = line
-        stripped_line = line.strip()
-
-        if not stripped_line or stripped_line.startswith("#"):
-            output_lines.append(original_line)
-            continue
-
-        decoded_line = html.unescape(stripped_line)
-        match = parameter_pattern.search(decoded_line)
-
-        if match:
-            new_url = decoded_line[:match.start()]
-        else:
-            new_url = decoded_line
-
-        if new_url != stripped_line:
-            changed += 1
-
-        output_lines.append(new_url)
-
-    urls_text.delete("1.0", "end")
-    urls_text.insert("1.0", "\n".join(output_lines).strip() + "\n")
+    output_text, changed = strip_parameter_like_ampersand_tags_from_text(content)
+    replace_text_widget_content(urls_text, output_text)
     append_log(f"\nStripped parameter-like ampersand tags from {changed} URL(s) in the URL box.\n")
 
 
@@ -2395,6 +2905,132 @@ def extract_urls_from_text(text_value):
             urls.append(url)
 
     return urls
+
+
+def get_text_widget_content(widget, end_index="end-1c", strip=False):
+    try:
+        value = widget.get("1.0", end_index)
+    except Exception:
+        value = ""
+    return value.strip() if strip else value
+
+
+def replace_text_widget_content(widget, content):
+    widget.delete("1.0", "end")
+    if content:
+        widget.insert("1.0", str(content))
+
+
+def set_text_widget_url_lines(widget, urls):
+    replace_text_widget_content(widget, "\n".join(str(url) for url in (urls or [])).strip())
+
+
+def read_urls_from_input_paths(paths, log_errors=True):
+    urls = []
+    for input_path in paths or []:
+        urls.extend(extract_urls_from_text(read_text_file_best_effort(input_path, log_errors=log_errors)))
+    return urls
+
+
+def get_url_source_text_from_widget(text_widget, input_paths, normalize_files=False, log_errors=True):
+    pasted = get_text_widget_content(text_widget, "end", strip=True)
+    if pasted:
+        return pasted
+
+    if input_paths:
+        parts = []
+        for path in input_paths:
+            content = read_text_file_best_effort(path, log_errors=log_errors)
+            parts.append(normalize_url_box_text_block(content) if normalize_files else content)
+        return "\n".join(parts)
+
+    return ""
+
+
+def get_url_list_from_widget(text_widget, input_paths, log_errors=True):
+    pasted = get_text_widget_content(text_widget, "end", strip=True)
+    pasted_urls = extract_urls_from_text(pasted)
+    if pasted_urls:
+        return pasted_urls
+    return read_urls_from_input_paths(input_paths, log_errors=log_errors)
+
+
+def strip_parameter_like_ampersand_tags_from_text(content):
+    output_lines = []
+    changed = 0
+    parameter_pattern = re.compile(r"&[A-Za-z][A-Za-z0-9_-]*=")
+
+    for line in str(content or "").splitlines():
+        original_line = line
+        stripped_line = line.strip()
+
+        if not stripped_line or stripped_line.startswith("#"):
+            output_lines.append(original_line)
+            continue
+
+        decoded_line = html.unescape(stripped_line)
+        match = parameter_pattern.search(decoded_line)
+        new_url = decoded_line[:match.start()] if match else decoded_line
+
+        if new_url != stripped_line:
+            changed += 1
+
+        output_lines.append(new_url)
+
+    return "\n".join(output_lines).strip() + ("\n" if output_lines else ""), changed
+
+
+def deduplicate_urls_from_source_text(source_text):
+    output_urls = []
+    seen = set()
+    duplicate_count = 0
+
+    for url in extract_urls_from_text(source_text):
+        normalized = normalize_url_for_compare(url)
+        if normalized in seen:
+            duplicate_count += 1
+            continue
+        seen.add(normalized)
+        output_urls.append(clean_extracted_url(url))
+
+    return output_urls, duplicate_count
+
+
+def group_urls_by_domain_lines(urls):
+    groups = {}
+    order = []
+
+    for url in urls or []:
+        domain = get_url_domain_key(url) or "unknown"
+        if domain not in groups:
+            groups[domain] = []
+            order.append(domain)
+        groups[domain].append(url)
+
+    output_lines = []
+    for domain in sorted(order):
+        output_lines.append(f"# {domain}")
+        output_lines.extend(groups[domain])
+        output_lines.append("")
+
+    return output_lines, groups
+
+
+def build_url_statistics_lines(urls):
+    counts = {}
+    for url in urls or []:
+        domain = get_url_domain_key(url) or "unknown"
+        counts[domain] = counts.get(domain, 0) + 1
+
+    lines = [
+        f"Total URLs: {len(urls or [])}",
+        f"Unique URLs: {len({normalize_url_for_compare(url) for url in (urls or [])})}",
+        f"Domains: {len(counts)}",
+        "",
+        "Total by domain:",
+    ]
+    lines.extend(f"  {domain}: {count}" for domain, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+    return lines, counts
 
 
 def normalize_url_for_compare(url):
@@ -2446,46 +3082,23 @@ def read_text_file_best_effort(path, log_errors=False):
 
 
 def get_current_url_source_text():
-    pasted = urls_text.get("1.0", "end").strip()
-    if pasted:
-        return pasted
-
-    input_paths = get_existing_input_file_paths()
-    if input_paths:
-        return "\n".join(
-            normalize_url_box_text_block(read_text_file_best_effort(path, log_errors=True))
-            for path in input_paths
-        )
-
-    return ""
+    return get_url_source_text_from_widget(
+        urls_text,
+        get_existing_input_file_paths(),
+        normalize_files=True,
+        log_errors=True,
+    )
 
 
 def get_current_url_list_for_tools(use_all_cache=True):
     if use_all_cache and url_view_mode == "failed" and url_all_view_cache:
         return list(url_all_view_cache)
 
-    pasted = urls_text.get("1.0", "end").strip()
-    pasted_urls = extract_urls_from_text(pasted)
-
-    if pasted_urls:
-        return pasted_urls
-
-    input_paths = get_existing_input_file_paths()
-    if input_paths:
-        urls = []
-        for input_path in input_paths:
-            urls.extend(extract_urls_from_text(read_text_file_best_effort(input_path, log_errors=True)))
-        return urls
-
-    return []
+    return get_url_list_from_widget(urls_text, get_existing_input_file_paths(), log_errors=True)
 
 
 def set_url_box_urls(urls, include_group_headers=False):
-    urls_text.delete("1.0", "end")
-    if not urls:
-        return
-
-    urls_text.insert("1.0", "\n".join(urls).strip())
+    set_text_widget_url_lines(urls_text, urls)
 
 
 def get_gui_failed_urls_path(output_root=None):
@@ -2605,24 +3218,8 @@ def group_urls_by_tld():
         messagebox.showwarning("No URLs", "No URLs are available to group.")
         return
 
-    groups = {}
-    order = []
-
-    for url in urls:
-        domain = get_url_domain_key(url) or "unknown"
-        if domain not in groups:
-            groups[domain] = []
-            order.append(domain)
-        groups[domain].append(url)
-
-    output_lines = []
-    for domain in sorted(order):
-        output_lines.append(f"# {domain}")
-        output_lines.extend(groups[domain])
-        output_lines.append("")
-
-    urls_text.delete("1.0", "end")
-    urls_text.insert("1.0", "\n".join(output_lines).strip())
+    output_lines, groups = group_urls_by_domain_lines(urls)
+    replace_text_widget_content(urls_text, "\n".join(output_lines).strip())
     append_log(f"\nGrouped {len(urls)} URL(s) by {len(groups)} domain(s).\n")
 
 
@@ -2632,20 +3229,7 @@ def show_url_statistics():
         messagebox.showinfo("URL Statistics", "No URLs found.")
         return
 
-    counts = {}
-    for url in urls:
-        domain = get_url_domain_key(url) or "unknown"
-        counts[domain] = counts.get(domain, 0) + 1
-
-    lines = [
-        f"Total URLs: {len(urls)}",
-        f"Unique URLs: {len({normalize_url_for_compare(url) for url in urls})}",
-        f"Domains: {len(counts)}",
-        "",
-        "Total by domain:",
-    ]
-    for domain, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
-        lines.append(f"  {domain}: {count}")
+    lines, _counts = build_url_statistics_lines(urls)
 
     dialog = tk.Toplevel(root)
     dialog.title("URL Statistics")
@@ -2666,27 +3250,10 @@ def remove_duplicate_urls_from_box():
         messagebox.showwarning("No URLs", "No URL text or input file contents were found.")
         return
 
-    extracted = extract_urls_from_text(source_text)
-    output_urls = []
-    seen = set()
-    duplicate_count = 0
-
-    for url in extracted:
-        cleaned = clean_extracted_url(url)
-        normalized = normalize_url_for_compare(cleaned)
-        if normalized in seen:
-            duplicate_count += 1
-            continue
-        seen.add(normalized)
-        output_urls.append(cleaned)
-
+    output_urls, duplicate_count = deduplicate_urls_from_source_text(source_text)
     set_url_box_urls(output_urls)
-    messagebox.showinfo(
-        "Duplicates Removed",
-        f"Unique URLs kept: {len(output_urls)}\nDuplicates removed: {duplicate_count}",
-    )
+    messagebox.showinfo("Duplicates Removed", f"Unique URLs kept: {len(output_urls)}\nDuplicates removed: {duplicate_count}")
     append_log(f"\nRemoved {duplicate_count} duplicate URL(s); kept {len(output_urls)} unique URL(s).\n")
-
 
 def analyze_url_source_text(source_text):
     source_text = str(source_text or "")
@@ -2833,7 +3400,7 @@ def normalize_urls_in_box():
 
 
 def copy_urls_from_box():
-    content = urls_text.get("1.0", "end-1c")
+    content = get_text_widget_content(urls_text, "end-1c", strip=False)
 
     if not content.strip():
         source_text = get_current_url_source_text()
@@ -2844,10 +3411,7 @@ def copy_urls_from_box():
         return
 
     try:
-        root.clipboard_clear()
-        root.clipboard_append(content)
-        root.update()
-        append_log(f"\nCopied URL text to clipboard ({len(content)} character(s)).\n")
+        copy_text_to_clipboard(content, label=f"URL text ({len(content)} character(s))")
     except Exception as e:
         messagebox.showerror("Copy failed", f"Could not copy URL text to the clipboard:\n\n{e}")
 
@@ -4574,8 +5138,7 @@ def save_domain_presets(show_popup=False):
                 messagebox.showinfo("Presets unchanged", f"No domain preset changes detected.\n\n{SETTINGS_FILE}")
             return True
 
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(store, f, indent=2)
+        atomic_write_json(SETTINGS_FILE, store, indent=2)
 
         append_log(f"\nDomain presets saved to: {SETTINGS_FILE}\n")
         log_domain_presets_status("Domain presets")
@@ -5689,8 +6252,7 @@ def save_app_settings(show_popup=False, changed_setting_label=None):
                 messagebox.showinfo("Settings unchanged", f"No app setting changes detected.\n\n{SETTINGS_FILE}")
             return True
 
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(store, f, indent=2)
+        atomic_write_json(SETTINGS_FILE, store, indent=2)
 
         if changed_setting_label:
             append_log(f"\nApp-level setting changed: {changed_setting_label}\n")
@@ -5720,7 +6282,7 @@ def update_cookies_file_control_state():
 def toggle_use_cookies_file_setting():
     update_cookies_file_control_state()
     state = "enabled" if use_cookies_file_var.get() else "disabled"
-    saved = save_settings(show_popup=False)
+    saved = schedule_settings_autosave()
     if saved:
         append_log(f"Profile setting changed: Use Cookies File {state}\n")
 
@@ -5798,7 +6360,7 @@ def toggle_job_persistence_setting():
     state = "enabled" if job_persistence_var.get() else "disabled"
     saved = save_app_settings(show_popup=False, changed_setting_label=f"Job Persistence {state}")
     if saved and job_persistence_var.get():
-        save_job_queue_state()
+        save_job_queue_state(immediate=True)
         append_log(f"Job queue state saved to: {JOBS_FILE}\n")
 
 
@@ -6004,10 +6566,13 @@ def delete_selected_cookies_file_on_exit():
 
     if failures:
         failure_text = "\n\n".join(f"{label}:\n{path}\n{error}" for label, path, error in failures)
-        messagebox.showwarning(
-            "Cookies file not deleted",
-            "Delete cookies on exit is enabled, but one or more cookies files could not be deleted:\n\n" + failure_text,
-        )
+        if APP_CLOSING:
+            append_log("\nDelete cookies on exit could not delete one or more cookies files:\n" + failure_text + "\n")
+        else:
+            messagebox.showwarning(
+                "Cookies file not deleted",
+                "Delete cookies on exit is enabled, but one or more cookies files could not be deleted:\n\n" + failure_text,
+            )
 
 
 def get_settings_store_version(raw):
@@ -6162,6 +6727,41 @@ def read_json_for_compare(path):
         return None
 
 
+def atomic_write_json(path, payload, indent=2, ensure_ascii=False, newline=False):
+    """Write JSON state files with same-folder temp + atomic replace.
+
+    This avoids leaving a partially written settings/jobs/recovery file if the
+    app or system stops in the middle of a write.
+    """
+    target = os.path.abspath(path)
+    target_dir = os.path.dirname(target) or "."
+    os.makedirs(target_dir, exist_ok=True)
+    tmp_path = os.path.join(
+        target_dir,
+        f".{os.path.basename(target)}.{os.getpid()}.{threading.get_ident()}.tmp",
+    )
+
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=indent, ensure_ascii=ensure_ascii)
+            if newline:
+                f.write("\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+
+        os.replace(tmp_path, target)
+        return True
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
 def settings_payload_has_changed(path, new_payload):
     existing_payload = read_json_for_compare(path)
 
@@ -6171,7 +6771,7 @@ def settings_payload_has_changed(path, new_payload):
     return canonicalize_settings_for_compare(existing_payload) != canonicalize_settings_for_compare(new_payload)
 
 
-def save_settings(show_popup=True, path=None):
+def save_settings(show_popup=True, path=None, log_saved=True):
     global settings_store
 
     try:
@@ -6193,10 +6793,10 @@ def save_settings(show_popup=True, path=None):
                 messagebox.showinfo("Settings unchanged", f"No settings changes detected.\n\n{settings_path}")
             return True
 
-        with open(settings_path, "w", encoding="utf-8") as f:
-            json.dump(store, f, indent=2)
+        atomic_write_json(settings_path, store, indent=2)
 
-        append_log(f"\nSettings saved to: {settings_path}\n")
+        if log_saved or show_popup:
+            append_log(f"\nSettings saved to: {settings_path}\n")
 
         if show_popup:
             messagebox.showinfo("Settings saved", f"Settings saved to:\n\n{settings_path}")
@@ -6207,6 +6807,44 @@ def save_settings(show_popup=True, path=None):
     except Exception as e:
         messagebox.showerror("Save failed", f"Could not save settings:\n\n{e}")
         return False
+
+
+def schedule_settings_autosave(delay_ms=SETTINGS_AUTOSAVE_DELAY_MS):
+    global settings_autosave_after_id
+
+    try:
+        if settings_autosave_after_id:
+            root.after_cancel(settings_autosave_after_id)
+    except Exception:
+        pass
+
+    def do_autosave():
+        global settings_autosave_after_id
+        settings_autosave_after_id = None
+        save_settings(show_popup=False, log_saved=False)
+
+    try:
+        settings_autosave_after_id = safe_after(delay_ms, do_autosave)
+    except Exception:
+        settings_autosave_after_id = None
+
+    return True
+
+
+def flush_settings_autosave():
+    global settings_autosave_after_id
+
+    pending = bool(settings_autosave_after_id)
+    try:
+        if settings_autosave_after_id:
+            root.after_cancel(settings_autosave_after_id)
+    except Exception:
+        pass
+
+    settings_autosave_after_id = None
+    if pending:
+        return save_settings(show_popup=False, log_saved=False)
+    return True
 
 
 def save_settings_dialog():
@@ -6386,8 +7024,7 @@ def save_current_settings_to_profile():
 
     # Saving a custom profile must not refresh or overwrite the Default profile.
     try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(store, f, indent=2)
+        atomic_write_json(SETTINGS_FILE, store, indent=2)
 
         append_log(f"\nProfile saved: {profile_name}\n")
         append_log(f"Settings saved to: {SETTINGS_FILE}\n")
@@ -6632,7 +7269,7 @@ def start_capture():
                     start_job_queue()
                 cleanup_command_input_file_if_temp(cmd)
                 return
-        save_settings(show_popup=False)
+        schedule_settings_autosave()
     except Exception as e:
         cleanup_command_input_file_if_temp(cmd)
         messagebox.showerror("Input error", str(e))
@@ -6728,7 +7365,7 @@ def start_capture():
                     skip_record = parse_universal_archive_skip_output_line(line)
                     if skip_record:
                         universal_skip_records.append(skip_record)
-                        root.after(0, append_log, format_universal_archive_skip_record_for_log(skip_record) + "\n")
+                        queue_append_log(format_universal_archive_skip_record_for_log(skip_record) + "\n")
                         continue
 
                     skip_summary = parse_universal_archive_skip_summary_line(line)
@@ -6736,36 +7373,36 @@ def start_capture():
                         universal_skip_summary = skip_summary
                         continue
 
-                    root.after(0, append_log, line)
+                    queue_append_log(line)
                     if direct_recovery_job_id and (line.startswith("GUI_QUEUE_URL_COMPLETE	") or line.startswith("GUI_QUEUE_URL_INCOMPLETE	")):
-                        root.after(0, handle_queue_output_line, direct_recovery_job_id, line)
+                        safe_after(0, handle_queue_output_line, direct_recovery_job_id, line)
 
             exit_code = running_process.wait()
 
-            root.after(0, finish_direct_recovery_job, direct_recovery_job_id, exit_code)
-            root.after(0, show_run_summary, exit_code, submitted_url_count, universal_skip_records, universal_skip_summary)
+            safe_after(0, finish_direct_recovery_job, direct_recovery_job_id, exit_code)
+            safe_after(0, show_run_summary, exit_code, submitted_url_count, universal_skip_records, universal_skip_summary)
 
             if exit_code == 0:
-                root.after(0, set_status, "Done")
-                root.after(0, append_log, f"\nProcess completed successfully. Exit code: {exit_code}\n")
+                safe_after(0, set_status, "Done")
+                queue_append_log(f"\nProcess completed successfully. Exit code: {exit_code}\n")
             else:
-                root.after(0, set_status, f"Finished with exit code {exit_code}")
-                root.after(0, append_log, f"\nProcess finished with exit code: {exit_code}\n")
+                safe_after(0, set_status, f"Finished with exit code {exit_code}")
+                queue_append_log(f"\nProcess finished with exit code: {exit_code}\n")
 
         except Exception as e:
-            root.after(0, set_status, "Error")
-            root.after(0, append_log, f"\nERROR: {e}\n")
+            safe_after(0, set_status, "Error")
+            queue_append_log(f"\nERROR: {e}\n")
 
         finally:
             cleanup_command_input_file_if_temp(cmd)
             active_av_direct_recovery_job_id = ""
             active_av_direct_domains = []
             active_av_direct_case_name = ""
-            root.after(0, lambda: start_button.config(state="normal"))
-            root.after(0, lambda: start_menu_button.config(state="normal"))
-            root.after(0, lambda: stop_button.config(state="disabled"))
+            safe_after(0, lambda: start_button.config(state="normal"))
+            safe_after(0, lambda: start_menu_button.config(state="normal"))
+            safe_after(0, lambda: stop_button.config(state="disabled"))
 
-    threading.Thread(target=worker, daemon=True).start()
+    start_daemon_thread("worker", worker)
 
 
 def show_run_summary(exit_code, submitted_url_count, universal_skip_records=None, universal_skip_summary=None):
@@ -7337,21 +7974,21 @@ def append_loaded_job_schema_warning(warnings):
             append_log(f"    ... {len(items) - 8} more\n")
 
 
-def save_job_queue_state():
+def build_job_queue_state_payload():
+    return {
+        "type": "avi-capture-gui-job-queue",
+        "version": JOBS_FILE_VERSION,
+        "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "jobs": [serialize_queue_job(job) for job in job_queue],
+    }
+
+
+def write_job_queue_state_now():
     if job_queue_state_loading or not job_persistence_is_enabled():
         return False
 
     try:
-        payload = {
-            "type": "avi-capture-gui-job-queue",
-            "version": JOBS_FILE_VERSION,
-            "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "jobs": [serialize_queue_job(job) for job in job_queue],
-        }
-
-        with open(JOBS_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-
+        atomic_write_json(JOBS_FILE, build_job_queue_state_payload(), indent=2)
         return True
     except Exception as e:
         try:
@@ -7359,6 +7996,53 @@ def save_job_queue_state():
         except Exception:
             pass
         return False
+
+
+def schedule_job_queue_state_save(delay_ms=JOB_QUEUE_SAVE_DELAY_MS):
+    global job_queue_save_after_id
+
+    if job_queue_state_loading or not job_persistence_is_enabled():
+        return False
+
+    try:
+        if job_queue_save_after_id:
+            root.after_cancel(job_queue_save_after_id)
+    except Exception:
+        pass
+
+    def do_save():
+        global job_queue_save_after_id
+        job_queue_save_after_id = None
+        write_job_queue_state_now()
+
+    try:
+        job_queue_save_after_id = safe_after(delay_ms, do_save)
+        return True
+    except Exception:
+        job_queue_save_after_id = None
+        return write_job_queue_state_now()
+
+
+def flush_job_queue_state_save():
+    global job_queue_save_after_id
+
+    pending = bool(job_queue_save_after_id)
+    try:
+        if job_queue_save_after_id:
+            root.after_cancel(job_queue_save_after_id)
+    except Exception:
+        pass
+
+    job_queue_save_after_id = None
+    if pending:
+        return write_job_queue_state_now()
+    return True
+
+
+def save_job_queue_state(immediate=False):
+    if immediate or APP_CLOSING:
+        return write_job_queue_state_now()
+    return schedule_job_queue_state_save()
 
 
 def load_job_queue_state(startup=False):
@@ -7413,6 +8097,13 @@ def load_job_queue_state(startup=False):
 
         append_loaded_job_schema_warning(schema_warnings)
 
+        if interrupted_count:
+            job_queue_state_loading = False
+            save_job_queue_state(immediate=True)
+            job_queue_state_loading = True
+            if startup:
+                safe_after(600, show_startup_interrupted_jobs_prompt, interrupted_count)
+
         return True
     except Exception as e:
         try:
@@ -7440,8 +8131,8 @@ def mark_running_queue_jobs_interrupted(reason="Interrupted"):
             changed = True
 
     if changed:
+        save_job_queue_state(immediate=True)
         refresh_job_queue_window()
-        save_job_queue_state()
 
     return changed
 
@@ -7510,18 +8201,178 @@ def toggle_queue_job_checkmark(job_id):
 
     job["checked"] = not bool(job.get("checked", False))
     save_job_queue_state()
+    refresh_job_queue_window()
 
-    if job_queue_tree_is_available() and job_queue_tree.exists(job_id):
+
+def get_queue_job_origin_label(job):
+    return "Direct" if bool(job.get("direct_capture", False)) else "Queued"
+
+
+def get_job_queue_filter_value():
+    try:
+        value = str(job_queue_filter_var.get() or "All")
+    except Exception:
+        value = "All"
+    return value if value in JOB_QUEUE_FILTER_OPTIONS else "All"
+
+
+def job_matches_queue_filter(job, filter_value=None):
+    filter_value = filter_value or get_job_queue_filter_value()
+    status = str(job.get("status") or "pending").lower()
+
+    if filter_value == "All":
+        return True
+    if filter_value == "Checked":
+        return bool(job.get("checked", False))
+    if filter_value == "Incomplete":
+        return status in {"pending", "running", "interrupted", "failed", "cancelled"}
+    return status == filter_value.lower()
+
+
+def get_visible_job_queue_jobs():
+    filter_value = get_job_queue_filter_value()
+    return [job for job in job_queue if job_matches_queue_filter(job, filter_value)]
+
+
+def get_queue_job_display_values(job, display_index):
+    return (
+        "☑" if bool(job.get("checked", False)) else "☐",
+        display_index,
+        job.get("engine", "yt-dlp"),
+        get_queue_job_origin_label(job),
+        job.get("status", "pending"),
+        job.get("resolved_case_name", ""),
+        len(job.get("urls", [])),
+        ", ".join(job.get("domains", []) or get_job_domain_keys(job)),
+        ", ".join(job.get("applied_domain_presets", []) or []),
+        job.get("output_root", ""),
+        job.get("started", ""),
+        job.get("finished", ""),
+        job.get("exit_code", ""),
+    )
+
+
+def get_job_queue_counts():
+    counts = {"total": len(job_queue), "checked": 0}
+    for job in job_queue:
+        status = str(job.get("status") or "pending").lower()
+        counts[status] = counts.get(status, 0) + 1
+        if bool(job.get("checked", False)):
+            counts["checked"] += 1
+    counts["incomplete"] = sum(
+        counts.get(status, 0) for status in ("pending", "running", "interrupted", "failed", "cancelled")
+    )
+    return counts
+
+
+def format_job_queue_summary():
+    counts = get_job_queue_counts()
+    visible_count = len(get_visible_job_queue_jobs())
+    total_urls = sum(len(job.get("urls", [])) for job in job_queue)
+    completed_urls = sum(int(job.get("completed_urls", 0) or 0) for job in job_queue)
+    return (
+        f"Showing {visible_count}/{counts.get('total', 0)} job(s) | "
+        f"Running {counts.get('running', 0)} | Pending {counts.get('pending', 0)} | "
+        f"Interrupted {counts.get('interrupted', 0)} | Failed {counts.get('failed', 0)} | "
+        f"Completed {counts.get('completed', 0)} | Checked {counts.get('checked', 0)} | "
+        f"URLs {completed_urls}/{total_urls}"
+    )
+
+
+def update_job_queue_summary_label():
+    summary = format_job_queue_summary()
+    for var in (job_queue_summary_var, job_queue_visible_count_var):
         try:
-            job_queue_tree.set(job_id, "selected", "☑" if job["checked"] else "☐")
+            if var is not None:
+                var.set(summary)
         except Exception:
             pass
 
+    try:
+        update_job_queue_recovery_banner()
+    except NameError:
+        pass
+    except Exception as e:
+        log_debug_exception("Could not update Job Queue recovery banner", e)
+
+
+def get_interrupted_job_count():
+    return sum(1 for job in job_queue if str(job.get("status") or "").lower() == "interrupted")
+
+
+def show_interrupted_jobs_in_queue():
+    try:
+        open_job_queue(select_tab=True)
+        if job_queue_filter_var is not None:
+            job_queue_filter_var.set("Interrupted")
+        refresh_job_queue_window()
+        if job_queue_status_var is not None:
+            job_queue_status_var.set("Showing interrupted jobs. Highlight or checkmark job(s), then use Continue Interrupted.")
+    except Exception as e:
+        log_debug_exception("Could not show interrupted jobs", e)
+
+
+def update_job_queue_recovery_banner():
+    count = get_interrupted_job_count()
+
+    try:
+        if job_queue_recovery_banner_var is not None:
+            if count:
+                job_queue_recovery_banner_var.set(
+                    f"Interrupted job(s) found: {count}. Open or filter the Job Queue to continue recoverable captures."
+                )
+            else:
+                job_queue_recovery_banner_var.set("")
+    except Exception:
+        pass
+
+    try:
+        if job_queue_recovery_banner_frame is not None:
+            if count:
+                job_queue_recovery_banner_frame.grid()
+            else:
+                job_queue_recovery_banner_frame.grid_remove()
+    except Exception:
+        pass
+
+
+def show_startup_interrupted_jobs_prompt(count):
+    global STARTUP_INTERRUPTED_PROMPT_SHOWN
+
+    if STARTUP_INTERRUPTED_PROMPT_SHOWN or not count:
+        return
+
+    STARTUP_INTERRUPTED_PROMPT_SHOWN = True
+
+    try:
+        set_status(f"Interrupted job(s) found: {count}. Open Job Queue to continue recoverable captures.")
+    except Exception:
+        pass
+
+    try:
+        append_log(
+            f"\nInterrupted job(s) found: {count}. Open the Job Queue and use Continue Interrupted to resume recoverable captures.\n"
+        )
+    except Exception:
+        pass
+
+    try:
+        open_job_queue(select_tab=False)
+        update_job_queue_recovery_banner()
+    except Exception as e:
+        log_debug_exception("Could not display startup interrupted-job prompt", e)
+
+
+def on_job_queue_filter_changed(event=None):
+    refresh_job_queue_window()
+
 
 def refresh_job_queue_window():
+    global job_queue_row_cache
+
     if not job_queue_tree_is_available():
         update_job_queue_progress()
-        save_job_queue_state()
+        update_job_queue_summary_label()
         return
 
     try:
@@ -7530,32 +8381,50 @@ def refresh_job_queue_window():
     except Exception:
         selected_id = ""
 
-    for item in job_queue_tree.get_children(""):
-        job_queue_tree.delete(item)
+    try:
+        focus_id = job_queue_tree.focus()
+    except Exception:
+        focus_id = ""
 
-    for index, job in enumerate(job_queue, start=1):
-        job_queue_tree.insert(
-            "",
-            "end",
-            iid=job["job_id"],
-            values=(
-                "☑" if bool(job.get("checked", False)) else "☐",
-                index,
-                job.get("engine", "yt-dlp"),
-                job.get("status", "pending"),
-                job.get("resolved_case_name", ""),
-                len(job.get("urls", [])),
-                ", ".join(job.get("domains", []) or get_job_domain_keys(job)),
-                ", ".join(job.get("applied_domain_presets", []) or []),
-                job.get("output_root", ""),
-                job.get("started", ""),
-                job.get("finished", ""),
-                job.get("exit_code", ""),
-            ),
-        )
+    visible_jobs = get_visible_job_queue_jobs()
+    visible_ids = {job.get("job_id") for job in visible_jobs}
 
-    if selected_id and job_queue_tree.exists(selected_id):
-        job_queue_tree.selection_set(selected_id)
+    try:
+        for item in list(job_queue_tree.get_children("")):
+            if item not in visible_ids:
+                job_queue_tree.delete(item)
+                job_queue_row_cache.pop(item, None)
+    except Exception:
+        pass
+
+    for display_index, job in enumerate(visible_jobs, start=1):
+        job_id = job.get("job_id")
+        if not job_id:
+            continue
+        values = get_queue_job_display_values(job, display_index)
+        try:
+            if job_queue_tree.exists(job_id):
+                if job_queue_row_cache.get(job_id) != values:
+                    job_queue_tree.item(job_id, values=values)
+                    job_queue_row_cache[job_id] = values
+                job_queue_tree.move(job_id, "", display_index - 1)
+            else:
+                job_queue_tree.insert("", "end", iid=job_id, values=values)
+                job_queue_row_cache[job_id] = values
+        except Exception:
+            try:
+                if job_queue_tree.exists(job_id):
+                    job_queue_tree.delete(job_id)
+                job_queue_tree.insert("", "end", iid=job_id, values=values)
+                job_queue_row_cache[job_id] = values
+            except Exception:
+                pass
+
+    if selected_id and selected_id in visible_ids and job_queue_tree.exists(selected_id):
+        try:
+            job_queue_tree.selection_set(selected_id)
+        except Exception:
+            pass
     else:
         try:
             job_queue_tree.selection_remove(job_queue_tree.selection())
@@ -7563,9 +8432,15 @@ def refresh_job_queue_window():
         except Exception:
             pass
 
+    if focus_id and focus_id in visible_ids and job_queue_tree.exists(focus_id):
+        try:
+            job_queue_tree.focus(focus_id)
+        except Exception:
+            pass
+
     update_job_queue_selection_marks()
     update_job_queue_progress()
-    save_job_queue_state()
+    update_job_queue_summary_label()
 
 
 def update_job_queue_progress():
@@ -7596,6 +8471,8 @@ def update_job_queue_progress():
             job_queue_status_var.set(status_text)
         except Exception:
             pass
+
+    update_job_queue_summary_label()
 
 
 def add_urls_to_queue_as_job(urls, resolved_case_name=None, settings=None, case_template=None, playlist_name=None):
@@ -7651,6 +8528,7 @@ def add_urls_to_queue_as_job(urls, resolved_case_name=None, settings=None, case_
             "applied_domain_presets": applied_presets,
             "playlist_name": str(playlist_name or ""),
             "checked": False,
+            "direct_capture": False,
         }
         job["domains"] = get_job_domain_keys(job)
         job["allow_domain_collision"] = False
@@ -7663,6 +8541,7 @@ def add_urls_to_queue_as_job(urls, resolved_case_name=None, settings=None, case_
             mark_job_domain_policy(job, choice)
 
         job_queue.append(job)
+        save_job_queue_state()
         refresh_job_queue_window()
         append_log(f"\nAdded queue job: {resolved_case_name} ({len(clean_urls)} URL(s))\n")
         if applied_presets:
@@ -8108,7 +8987,7 @@ def show_split_queue_dialog(url_count):
             split_queue_group_count_var.set(str(value))
 
         try:
-            save_settings(show_popup=False)
+            schedule_settings_autosave()
         except Exception:
             pass
 
@@ -8278,16 +9157,16 @@ def get_highlighted_queue_jobs():
     return jobs
 
 
-def copy_text_to_clipboard(value, label="Text"):
+def copy_text_to_clipboard(value, label="Text", log_func=None, empty_message=None):
     value = str(value or "")
 
     if not value:
-        messagebox.showinfo("Nothing to copy", f"{label} is blank.")
+        messagebox.showinfo("Nothing to copy", empty_message or f"{label} is blank.")
         return False
 
     root.clipboard_clear()
     root.clipboard_append(value)
-    append_log(f"\n{label} copied to clipboard.\n")
+    (log_func or append_log)(f"\n{label} copied to clipboard.\n")
     return True
 
 
@@ -8300,6 +9179,7 @@ def format_queue_job_details(job):
 
     lines = [
         f"Engine: {job.get('engine', 'yt-dlp')}",
+        f"Origin: {get_queue_job_origin_label(job)}",
         f"Case: {job.get('resolved_case_name', '')}",
         f"Status: {job.get('status', 'pending')}",
         f"URL count: {len(urls)}",
@@ -8416,6 +9296,8 @@ def duplicate_selected_queue_job():
 
         duplicate = {
             "job_id": make_job_id(),
+            "engine": get_job_engine(job),
+            "settings_schema_version": SETTINGS_SCHEMA_VERSION,
             "status": "pending",
             "case_template": case_template,
             "resolved_case_name": resolved_case_name,
@@ -8431,9 +9313,11 @@ def duplicate_selected_queue_job():
             "applied_domain_presets": list(job.get("applied_domain_presets", []) or []),
             "allow_domain_collision": bool(job.get("allow_domain_collision", False)),
             "checked": False,
+            "direct_capture": False,
         }
 
         job_queue.append(duplicate)
+        save_job_queue_state()
         refresh_job_queue_window()
         append_log(f"\nDuplicated queue job as pending: {resolved_case_name}\n")
     except Exception as e:
@@ -8457,6 +9341,7 @@ def remove_selected_queue_job():
         return
 
     job_queue = [item for item in job_queue if item.get("job_id") != job.get("job_id")]
+    save_job_queue_state()
     refresh_job_queue_window()
 
 
@@ -8469,6 +9354,7 @@ def clear_completed_queue_jobs():
         keep_status = {"pending"}
 
     job_queue = [job for job in job_queue if job.get("status") in keep_status]
+    save_job_queue_state()
     refresh_job_queue_window()
 
 
@@ -8484,6 +9370,7 @@ def clear_all_non_active_queue_jobs():
         if job.get("status") == "running" or job.get("job_id") in active_ids
     ]
 
+    save_job_queue_state()
     refresh_job_queue_window()
     append_log("\nCleared all non-active queue jobs.\n")
 
@@ -8948,8 +9835,7 @@ def write_job_recovery_manifest(job, event="state"):
             "failed_url_indexes": list(job.get("failed_url_indexes", []) or []),
             "archive_files": get_job_archive_files_for_recovery(job),
         }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+        atomic_write_json(path, payload, indent=2)
         return True
     except Exception as e:
         try:
@@ -8995,7 +9881,7 @@ def create_direct_recovery_job(engine, settings, urls, resolved_case_name, case_
     job["paths"] = get_expected_run_paths_for_values(job["output_root"], resolved_case_name)
     job_queue.append(job)
     write_job_recovery_manifest(job, "direct_started")
-    save_job_queue_state()
+    save_job_queue_state(immediate=True)
     refresh_job_queue_window()
     return job
 
@@ -9020,7 +9906,7 @@ def finish_direct_recovery_job(job_id, exit_code, summary=""):
         job["status"] = "failed"
         job["summary"] = ""
     write_job_recovery_manifest(job, "direct_finished")
-    save_job_queue_state()
+    save_job_queue_state(immediate=True)
     refresh_job_queue_window()
 
 
@@ -9120,8 +10006,9 @@ def run_queue_job(job):
                 job["status"] = "cancelled"
                 job["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 job["exit_code"] = "cancelled"
+                save_job_queue_state(immediate=True)
                 refresh_job_queue_window()
-                root.after(0, run_next_queue_job)
+                safe_after(0, run_next_queue_job)
                 return
 
         run_urls = get_queue_job_run_urls(job)
@@ -9154,7 +10041,7 @@ def run_queue_job(job):
             job["completed_urls"] = 0
         job["_interruption_requested"] = False
         write_job_recovery_manifest(job, "queue_started")
-        save_job_queue_state()
+        save_job_queue_state(immediate=True)
 
         refresh_job_queue_window()
         if job_queue_status_var and job_queue_window_is_open():
@@ -9193,7 +10080,7 @@ def run_queue_job(job):
         append_log(f"\nQueue job setup failed: {e}\n")
         cleanup_command_input_file_if_temp(cmd)
         refresh_job_queue_window()
-        root.after(0, run_next_queue_job)
+        safe_after(0, run_next_queue_job)
         return
 
     def worker():
@@ -9223,7 +10110,7 @@ def run_queue_job(job):
                     skip_record = parse_universal_archive_skip_output_line(line)
                     if skip_record:
                         universal_skip_records.append(skip_record)
-                        root.after(0, append_log, format_universal_archive_skip_record_for_log(skip_record) + "\n")
+                        queue_append_log(format_universal_archive_skip_record_for_log(skip_record) + "\n")
                         continue
 
                     skip_summary = parse_universal_archive_skip_summary_line(line)
@@ -9231,21 +10118,21 @@ def run_queue_job(job):
                         universal_skip_summary = skip_summary
                         continue
 
-                    root.after(0, append_log, line)
+                    queue_append_log(line)
                     if line.startswith("GUI_QUEUE_URL_COMPLETE\t") or line.startswith("GUI_QUEUE_URL_INCOMPLETE\t"):
-                        root.after(0, handle_queue_output_line, job["job_id"], line)
+                        safe_after(0, handle_queue_output_line, job["job_id"], line)
 
             exit_code = process.wait()
 
         except Exception as e:
-            root.after(0, append_log, f"\nERROR: {e}\n")
+            queue_append_log(f"\nERROR: {e}\n")
             exit_code = 1
         finally:
             cleanup_command_input_file_if_temp(cmd)
 
-        root.after(0, finish_queue_job, job["job_id"], exit_code, submitted_url_count, universal_skip_records, universal_skip_summary)
+        safe_after(0, finish_queue_job, job["job_id"], exit_code, submitted_url_count, universal_skip_records, universal_skip_summary)
 
-    threading.Thread(target=worker, daemon=True).start()
+    start_daemon_thread("worker", worker)
 
 
 def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_records=None, universal_skip_summary=None):
@@ -9316,7 +10203,7 @@ def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_reco
         job["summary"] = ""
 
     write_job_recovery_manifest(job, "queue_finished")
-    save_job_queue_state()
+    save_job_queue_state(immediate=True)
 
     job.pop("_run_mode", None)
     job.pop("_resume_base_completed", None)
@@ -9341,11 +10228,13 @@ def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_reco
         append_log("\nJob queue paused after current job.\n")
         return
 
-    root.after(250, run_next_queue_job)
+    safe_after(250, run_next_queue_job)
 
 
 def open_job_queue(select_tab=True):
     global job_queue_window, job_queue_tree, job_queue_progress_var, job_queue_status_var
+    global job_queue_filter_var, job_queue_summary_var, job_queue_visible_count_var, job_queue_row_cache
+    global job_queue_recovery_banner_frame, job_queue_recovery_banner_var
 
     if job_queue_window_is_open():
         if select_tab:
@@ -9372,8 +10261,9 @@ def open_job_queue(select_tab=True):
     job_queue_window = container
     job_queue_window.columnconfigure(0, weight=1)
     job_queue_window.rowconfigure(0, weight=0)
-    job_queue_window.rowconfigure(1, weight=1)
-    job_queue_window.rowconfigure(2, weight=0)
+    job_queue_window.rowconfigure(1, weight=0)
+    job_queue_window.rowconfigure(2, weight=1)
+    job_queue_window.rowconfigure(3, weight=0)
 
     top_bar = ttk.Frame(job_queue_window, padding=(8, 0, 8, 0))
     top_bar.grid(row=0, column=0, sticky="ew")
@@ -9390,12 +10280,44 @@ def open_job_queue(select_tab=True):
     ttk.Button(top_bar, text="Copy Jobs Summary", command=copy_completed_queue_job_summaries).pack(side="left", padx=(0, 6))
     ttk.Button(top_bar, text="Open Case", command=open_selected_queue_case).pack(side="left", padx=(0, 6))
 
+    filter_bar = ttk.Frame(job_queue_window, padding=(8, 4, 8, 4))
+    filter_bar.grid(row=1, column=0, sticky="ew")
+    filter_bar.columnconfigure(3, weight=1)
+
+    ttk.Label(filter_bar, text="Filter").grid(row=0, column=0, sticky="w", padx=(0, 6))
+    job_queue_filter_var = tk.StringVar(value=get_job_queue_filter_value())
+    filter_combo = ttk.Combobox(
+        filter_bar,
+        textvariable=job_queue_filter_var,
+        values=JOB_QUEUE_FILTER_OPTIONS,
+        state="readonly",
+        width=14,
+    )
+    filter_combo.grid(row=0, column=1, sticky="w", padx=(0, 10))
+    filter_combo.bind("<<ComboboxSelected>>", on_job_queue_filter_changed)
+
+    job_queue_summary_var = tk.StringVar(value="")
+    ttk.Label(filter_bar, textvariable=job_queue_summary_var).grid(row=0, column=2, columnspan=2, sticky="w")
+
+    job_queue_recovery_banner_var = tk.StringVar(value="")
+    job_queue_recovery_banner_frame = ttk.Frame(filter_bar, padding=(8, 6))
+    job_queue_recovery_banner_frame.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+    job_queue_recovery_banner_frame.columnconfigure(0, weight=1)
+    ttk.Label(
+        job_queue_recovery_banner_frame,
+        textvariable=job_queue_recovery_banner_var,
+        wraplength=900,
+        justify="left",
+    ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+    ttk.Button(job_queue_recovery_banner_frame, text="Show Interrupted", command=show_interrupted_jobs_in_queue).grid(row=0, column=1, sticky="e")
+    job_queue_recovery_banner_frame.grid_remove()
+
     table_frame = ttk.Frame(job_queue_window, padding=(8, 0, 8, 2))
-    table_frame.grid(row=1, column=0, sticky="nsew")
+    table_frame.grid(row=2, column=0, sticky="nsew")
     table_frame.columnconfigure(0, weight=1)
     table_frame.rowconfigure(0, weight=1)
 
-    columns = ("selected", "#", "engine", "status", "case", "urls", "domains", "presets", "output_root", "started", "finished", "exit")
+    columns = ("selected", "#", "engine", "origin", "status", "case", "urls", "domains", "presets", "output_root", "started", "finished", "exit")
     job_queue_tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
     job_queue_tree.grid(row=0, column=0, sticky="nsew")
 
@@ -9403,6 +10325,7 @@ def open_job_queue(select_tab=True):
         "selected": "Select",
         "#": "#",
         "engine": "Tool",
+        "origin": "Origin",
         "status": "Status",
         "case": "Case",
         "urls": "URLs",
@@ -9418,6 +10341,7 @@ def open_job_queue(select_tab=True):
         "selected": 70,
         "#": 45,
         "engine": 90,
+        "origin": 80,
         "status": 110,
         "case": 260,
         "urls": 60,
@@ -9471,11 +10395,15 @@ def open_job_queue(select_tab=True):
         try:
             if column_id == "#1":
                 toggle_queue_job_checkmark(row_id)
+                job_queue_tree.selection_set(row_id)
+                job_queue_tree.focus(row_id)
+                update_job_queue_selection_marks()
+                return "break"
 
             job_queue_tree.selection_set(row_id)
             job_queue_tree.focus(row_id)
             update_job_queue_selection_marks()
-            return "break"
+            return None
         except Exception:
             return
 
@@ -9626,7 +10554,7 @@ def open_job_queue(select_tab=True):
     job_queue_tree.bind("<Button-3>", show_job_queue_context_menu)
 
     bottom = ttk.Frame(job_queue_window, padding=(8, 0, 8, 2))
-    bottom.grid(row=2, column=0, sticky="ew")
+    bottom.grid(row=3, column=0, sticky="ew")
 
     job_queue_progress_var = tk.DoubleVar(value=0)
     progress = ttk.Progressbar(bottom, variable=job_queue_progress_var, maximum=100, mode="determinate")
@@ -9634,6 +10562,7 @@ def open_job_queue(select_tab=True):
 
     job_queue_status_var = tk.StringVar(value="Queue is empty.")
     ttk.Label(bottom, textvariable=job_queue_status_var).pack(fill="x", side="top")
+    job_queue_row_cache = {}
 
     if select_tab:
         try:
@@ -9643,6 +10572,98 @@ def open_job_queue(select_tab=True):
 
     apply_app_theme()
     refresh_job_queue_window()
+
+
+def terminate_process_tree(process, label="process", timeout_seconds=3):
+    """Terminate a subprocess and its child process tree when possible."""
+    if process is None:
+        return True
+
+    try:
+        if process.poll() is not None:
+            return True
+    except Exception as e:
+        log_debug_exception(f"Could not inspect {label} before termination", e)
+        return False
+
+    try:
+        pid = int(process.pid)
+    except Exception as e:
+        log_debug_exception(f"Could not determine PID for {label}", e)
+        pid = None
+
+    if os.name == "nt" and pid:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=max(2, timeout_seconds + 2),
+            )
+        except Exception as e:
+            log_debug_exception(f"taskkill failed for {label}", e)
+
+    try:
+        if process.poll() is None:
+            process.terminate()
+    except Exception as e:
+        log_debug_exception(f"Terminate failed for {label}", e)
+
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait(timeout=2)
+        except Exception as e:
+            log_debug_exception(f"Kill failed for {label}", e)
+    except Exception as e:
+        log_debug_exception(f"Wait after terminate failed for {label}", e)
+
+    try:
+        return process.poll() is not None
+    except Exception:
+        return False
+
+
+def flush_log_queues_now():
+    """Flush pending queued log text before shutdown destroys the widgets."""
+    global main_log_flush_after_id, image_log_flush_after_id
+
+    try:
+        main_text = collect_log_queue_text(main_log_queue)
+        if main_text:
+            append_log(main_text)
+    except Exception as e:
+        log_debug_exception("Final main log flush failed", e)
+
+    try:
+        image_text = collect_log_queue_text(image_log_queue)
+        if image_text:
+            image_append_log(image_text)
+    except Exception as e:
+        log_debug_exception("Final image log flush failed", e)
+
+    main_log_flush_after_id = None
+    image_log_flush_after_id = None
+
+
+def disable_start_controls_for_shutdown():
+    for widget_name in [
+        "start_button",
+        "start_menu_button",
+        "stop_button",
+        "image_start_button",
+        "image_start_menu_button",
+        "image_stop_button",
+    ]:
+        try:
+            widget = globals().get(widget_name)
+            if widget_exists(widget):
+                widget.configure(state="disabled")
+        except Exception as e:
+            log_debug_exception(f"Could not disable {widget_name} during shutdown", e)
+
 
 
 def stop_capture():
@@ -9655,10 +10676,9 @@ def stop_capture():
                 job["_interruption_requested"] = True
                 job["interrupted_reason"] = "Stopped by user."
             save_job_queue_state()
-            for process in list(job_queue_running_processes.values()):
-                if process is not None and process.poll() is None:
-                    process.terminate()
-            append_log("\nStop requested. Active queue process(es) terminated. Queue will pause after active job(s) stop.\n")
+            for job_id, process in list(job_queue_running_processes.items()):
+                terminate_process_tree(process, label=f"queue job {job_id}")
+            append_log("\nStop requested. Active queue process tree(s) terminated. Queue will pause after active job(s) stop.\n")
             set_status("Stopping queue...")
         except Exception as e:
             messagebox.showerror("Stop error", str(e))
@@ -9667,8 +10687,8 @@ def stop_capture():
     if running_process is not None and running_process.poll() is None:
         try:
             mark_running_queue_jobs_interrupted("Stopped by user.")
-            running_process.terminate()
-            append_log("\nStop requested. Process terminated.\n")
+            terminate_process_tree(running_process, label="direct Audio/Video capture")
+            append_log("\nStop requested. Audio/Video process tree terminated.\n")
             set_status("Stopped")
         except Exception as e:
             messagebox.showerror("Stop error", str(e))
@@ -9760,9 +10780,9 @@ def check_vpn_status():
             text = f"VPN: Check failed ({e})"
             last_vpn_status = "unknown"
 
-        root.after(0, vpn_status_var.set, text)
+        safe_after(0, vpn_status_var.set, text)
 
-    threading.Thread(target=worker, daemon=True).start()
+    start_daemon_thread("worker", worker)
 
 
 def refresh_network_adapters():
@@ -9861,12 +10881,12 @@ Get-NetAdapter -ErrorAction SilentlyContinue |
 
                 vpn_status_var.set(f"VPN: Loaded {len(values)} adapter(s). Select the adapter that represents your VPN.")
 
-            root.after(0, update_ui)
+            safe_after(0, update_ui)
 
         except Exception as e:
-            root.after(0, vpn_status_var.set, f"VPN: Adapter refresh failed ({e})")
+            safe_after(0, vpn_status_var.set, f"VPN: Adapter refresh failed ({e})")
 
-    threading.Thread(target=worker, daemon=True).start()
+    start_daemon_thread("worker", worker)
 
 
 
@@ -9894,21 +10914,21 @@ def check_ytdlp_version():
             output = (result.stdout or result.stderr or "").strip()
 
             if result.returncode == 0 and output:
-                root.after(0, yt_dlp_version_status_var.set, f"yt-dlp: {output}")
-                root.after(0, append_log, f"yt-dlp version: {output}\n")
+                safe_after(0, yt_dlp_version_status_var.set, f"yt-dlp: {output}")
+                queue_append_log(f"yt-dlp version: {output}\n")
             else:
-                root.after(0, yt_dlp_version_status_var.set, "yt-dlp: version check failed")
-                root.after(
+                safe_after(0, yt_dlp_version_status_var.set, "yt-dlp: version check failed")
+                safe_after(
                     0,
                     append_log,
                     f"yt-dlp version check failed. Exit code: {result.returncode}\n{output}\n",
                 )
 
         except Exception as e:
-            root.after(0, yt_dlp_version_status_var.set, "yt-dlp: version check error")
-            root.after(0, append_log, f"yt-dlp version check error: {e}\n")
+            safe_after(0, yt_dlp_version_status_var.set, "yt-dlp: version check error")
+            queue_append_log(f"yt-dlp version check error: {e}\n")
 
-    threading.Thread(target=worker, daemon=True).start()
+    start_daemon_thread("worker", worker)
 
 
 def normalize_version_for_compare(value):
@@ -10097,7 +11117,7 @@ def open_app_update_dialog():
                         f"Release page: {url}\n"
                     )
 
-                root.after(0, update_ui)
+                safe_after(0, update_ui)
 
             except Exception as e:
                 error_message = str(e)
@@ -10109,9 +11129,9 @@ def open_app_update_dialog():
                     append_log(f"\nFailed to check app updates: {error_message}\n")
                     messagebox.showerror("Update check failed", error_message)
 
-                root.after(0, show_error)
+                safe_after(0, show_error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        start_daemon_thread("worker", worker)
 
     ttk.Button(button_frame, text="Recheck", command=query_latest_release).pack(side="left", padx=6)
     ttk.Button(button_frame, text="Open Latest Release Page", command=open_latest_release_page).pack(side="left", padx=6)
@@ -10281,24 +11301,24 @@ def open_ytdlp_update_dialog():
                 output = (result.stdout or result.stderr or "").strip()
 
                 if result.returncode == 0 and output:
-                    root.after(0, current_version_var.set, f"Current detected version: {output}")
-                    root.after(0, yt_dlp_version_status_var.set, f"yt-dlp: {output}")
-                    root.after(0, append_log, f"Current yt-dlp version: {output}\n")
+                    safe_after(0, current_version_var.set, f"Current detected version: {output}")
+                    safe_after(0, yt_dlp_version_status_var.set, f"yt-dlp: {output}")
+                    queue_append_log(f"Current yt-dlp version: {output}\n")
                 else:
-                    root.after(0, current_version_var.set, "Current detected version: unable to detect")
-                    root.after(0, yt_dlp_version_status_var.set, "yt-dlp: version check failed")
-                    root.after(
+                    safe_after(0, current_version_var.set, "Current detected version: unable to detect")
+                    safe_after(0, yt_dlp_version_status_var.set, "yt-dlp: version check failed")
+                    safe_after(
                         0,
                         append_log,
                         f"Unable to detect current yt-dlp version. Exit code: {result.returncode}\n{output}\n",
                     )
 
             except Exception as e:
-                root.after(0, current_version_var.set, f"Current detected version: error ({e})")
-                root.after(0, yt_dlp_version_status_var.set, "yt-dlp: version check error")
-                root.after(0, append_log, f"yt-dlp version check error in update dialog: {e}\n")
+                safe_after(0, current_version_var.set, f"Current detected version: error ({e})")
+                safe_after(0, yt_dlp_version_status_var.set, "yt-dlp: version check error")
+                queue_append_log(f"yt-dlp version check error in update dialog: {e}\n")
 
-        threading.Thread(target=worker, daemon=True).start()
+        start_daemon_thread("worker", worker)
 
     def on_nightly_select(event=None):
         selection = nightly_listbox.curselection()
@@ -10344,14 +11364,15 @@ def open_ytdlp_update_dialog():
                         nightly_listbox.activate(0)
                         on_nightly_select()
 
-                root.after(0, update_ui)
+                safe_after(0, update_ui)
 
             except Exception as e:
-                root.after(0, nightly_status_var.set, "Failed to query GitHub nightlies.")
-                root.after(0, append_log, f"Failed to query yt-dlp nightly releases from GitHub: {e}\n")
-                root.after(0, messagebox.showerror, "Nightly query failed", str(e))
+                safe_after(0, nightly_status_var.set, "Failed to query GitHub nightlies.")
+                queue_append_log(f"Failed to query yt-dlp nightly releases from GitHub: {e}\n")
+                queue_append_log("Nightly query failed. Review gui-debug.log/output log if details are needed.\n")
+                log_debug_exception("yt-dlp nightly query failed", e)
 
-        threading.Thread(target=worker, daemon=True).start()
+        start_daemon_thread("worker", worker)
 
     def get_update_target():
         mode = update_mode_var.get()
@@ -10433,34 +11454,29 @@ def update_ytdlp_direct(update_target):
 
             if result.stdout:
                 for line in result.stdout:
-                    root.after(0, append_log, line)
+                    queue_append_log(line)
 
             exit_code = result.wait()
 
             if exit_code == 0:
-                root.after(0, append_log, f"\nyt-dlp update completed successfully. Exit code: {exit_code}\n")
-                root.after(0, set_status, "yt-dlp update complete")
-                root.after(0, messagebox.showinfo, "yt-dlp updated", "yt-dlp update completed successfully.")
-                root.after(0, check_ytdlp_version)
+                queue_append_log(f"\nyt-dlp update completed successfully. Exit code: {exit_code}\n")
+                safe_after(0, set_status, "yt-dlp update complete")
+                queue_append_log("yt-dlp update completed. No confirmation dialog was shown to avoid interrupting background workflows.\n")
+                safe_after(0, check_ytdlp_version)
             else:
-                root.after(0, append_log, f"\nyt-dlp update failed. Exit code: {exit_code}\n")
-                root.after(0, set_status, f"yt-dlp update failed with exit code {exit_code}")
-                root.after(
-                    0,
-                    messagebox.showwarning,
-                    "yt-dlp update failed",
-                    f"yt-dlp exited with code {exit_code}. Review the output log. "
-                    "If this was a recent nightly, ASR or endpoint protection may have blocked it.",
-                )
-                root.after(0, check_ytdlp_version)
+                queue_append_log(f"\nyt-dlp update failed. Exit code: {exit_code}\n")
+                safe_after(0, set_status, f"yt-dlp update failed with exit code {exit_code}")
+                queue_append_log("yt-dlp update failed. Review the output log; ASR or endpoint protection may have blocked a recent nightly.\n")
+                safe_after(0, check_ytdlp_version)
 
         except Exception as e:
-            root.after(0, set_status, "yt-dlp update error")
-            root.after(0, yt_dlp_version_status_var.set, "yt-dlp: update error")
-            root.after(0, append_log, f"\nyt-dlp update error: {e}\n")
-            root.after(0, messagebox.showerror, "yt-dlp update error", str(e))
+            safe_after(0, set_status, "yt-dlp update error")
+            safe_after(0, yt_dlp_version_status_var.set, "yt-dlp: update error")
+            queue_append_log(f"\nyt-dlp update error: {e}\n")
+            log_debug_exception("yt-dlp update error", e)
+            queue_append_log("yt-dlp update error. Details were written to gui-debug.log.\n")
 
-    threading.Thread(target=worker, daemon=True).start()
+    start_daemon_thread("worker", worker)
 
 
 
@@ -10626,24 +11642,24 @@ def open_gallerydl_update_dialog():
                 output = (result.stdout or result.stderr or "").strip()
 
                 if result.returncode == 0 and output:
-                    root.after(0, current_version_var.set, f"Current detected version: {output}")
-                    root.after(0, gallery_dl_version_status_var.set, f"gallery-dl: {output}")
-                    root.after(0, image_append_log, f"Current gallery-dl version: {output}\n")
+                    safe_after(0, current_version_var.set, f"Current detected version: {output}")
+                    safe_after(0, gallery_dl_version_status_var.set, f"gallery-dl: {output}")
+                    queue_image_append_log(f"Current gallery-dl version: {output}\n")
                 else:
-                    root.after(0, current_version_var.set, "Current detected version: unable to detect")
-                    root.after(0, gallery_dl_version_status_var.set, "gallery-dl: version check failed")
-                    root.after(
+                    safe_after(0, current_version_var.set, "Current detected version: unable to detect")
+                    safe_after(0, gallery_dl_version_status_var.set, "gallery-dl: version check failed")
+                    safe_after(
                         0,
                         image_append_log,
                         f"Unable to detect current gallery-dl version. Exit code: {result.returncode}\n{output}\n",
                     )
 
             except Exception as e:
-                root.after(0, current_version_var.set, f"Current detected version: error ({e})")
-                root.after(0, gallery_dl_version_status_var.set, "gallery-dl: version check error")
-                root.after(0, image_append_log, f"gallery-dl version check error in update dialog: {e}\n")
+                safe_after(0, current_version_var.set, f"Current detected version: error ({e})")
+                safe_after(0, gallery_dl_version_status_var.set, "gallery-dl: version check error")
+                queue_image_append_log(f"gallery-dl version check error in update dialog: {e}\n")
 
-        threading.Thread(target=worker, daemon=True).start()
+        start_daemon_thread("worker", worker)
 
     def on_release_select(event=None):
         selection = release_listbox.curselection()
@@ -10689,14 +11705,15 @@ def open_gallerydl_update_dialog():
                         release_listbox.activate(0)
                         on_release_select()
 
-                root.after(0, update_ui)
+                safe_after(0, update_ui)
 
             except Exception as e:
-                root.after(0, release_status_var.set, "Failed to query Codeberg releases.")
-                root.after(0, image_append_log, f"Failed to query gallery-dl releases from Codeberg: {e}\n")
-                root.after(0, messagebox.showerror, "Release query failed", str(e))
+                safe_after(0, release_status_var.set, "Failed to query Codeberg releases.")
+                queue_image_append_log(f"Failed to query gallery-dl releases from Codeberg: {e}\n")
+                queue_image_append_log("gallery-dl release query failed. Review gui-debug.log/output log if details are needed.\n")
+                log_debug_exception("gallery-dl release query failed", e)
 
-        threading.Thread(target=worker, daemon=True).start()
+        start_daemon_thread("worker", worker)
 
     def get_update_target():
         mode = update_mode_var.get()
@@ -10778,34 +11795,35 @@ def update_gallerydl_direct(update_target):
 
             if result.stdout:
                 for line in result.stdout:
-                    root.after(0, image_append_log, line)
+                    queue_image_append_log(line)
 
             exit_code = result.wait()
 
             if exit_code == 0:
-                root.after(0, image_append_log, f"\ngallery-dl update completed successfully. Exit code: {exit_code}\n")
-                root.after(0, image_set_status, "gallery-dl update complete")
-                root.after(0, messagebox.showinfo, "gallery-dl updated", "gallery-dl update completed successfully.")
-                root.after(0, check_gallery_dl_version)
+                queue_image_append_log(f"\ngallery-dl update completed successfully. Exit code: {exit_code}\n")
+                safe_after(0, image_set_status, "gallery-dl update complete")
+                queue_image_append_log("gallery-dl update completed. No confirmation dialog was shown to avoid interrupting background workflows.\n")
+                safe_after(0, check_gallery_dl_version)
             else:
-                root.after(0, image_append_log, f"\ngallery-dl update failed. Exit code: {exit_code}\n")
-                root.after(0, image_set_status, f"gallery-dl update failed with exit code {exit_code}")
-                root.after(
+                queue_image_append_log(f"\ngallery-dl update failed. Exit code: {exit_code}\n")
+                safe_after(0, image_set_status, f"gallery-dl update failed with exit code {exit_code}")
+                safe_after(
                     0,
                     messagebox.showwarning,
                     "gallery-dl update failed",
                     f"gallery-dl exited with code {exit_code}. Review the Image Capture output log. "
                     "ASR or endpoint protection may have blocked it.",
                 )
-                root.after(0, check_gallery_dl_version)
+                safe_after(0, check_gallery_dl_version)
 
         except Exception as e:
-            root.after(0, image_set_status, "gallery-dl update error")
-            root.after(0, gallery_dl_version_status_var.set, "gallery-dl: update error")
-            root.after(0, image_append_log, f"\ngallery-dl update error: {e}\n")
-            root.after(0, messagebox.showerror, "gallery-dl update error", str(e))
+            safe_after(0, image_set_status, "gallery-dl update error")
+            safe_after(0, gallery_dl_version_status_var.set, "gallery-dl: update error")
+            queue_image_append_log(f"\ngallery-dl update error: {e}\n")
+            log_debug_exception("gallery-dl update error", e)
+            queue_image_append_log("gallery-dl update error. Details were written to gui-debug.log.\n")
 
-    threading.Thread(target=worker, daemon=True).start()
+    start_daemon_thread("worker", worker)
 
 
 
@@ -10858,31 +11876,26 @@ def update_deno_direct():
 
             if result.stdout:
                 for line in result.stdout:
-                    root.after(0, append_log, line)
+                    queue_append_log(line)
 
             exit_code = result.wait()
 
             if exit_code == 0:
-                root.after(0, append_log, f"\nDeno update completed successfully. Exit code: {exit_code}\n")
-                root.after(0, set_status, "Deno update complete")
-                root.after(0, messagebox.showinfo, "Deno updated", "Deno update completed successfully.")
+                queue_append_log(f"\nDeno update completed successfully. Exit code: {exit_code}\n")
+                safe_after(0, set_status, "Deno update complete")
+                queue_append_log("Deno update completed. No confirmation dialog was shown to avoid interrupting background workflows.\n")
             else:
-                root.after(0, append_log, f"\nDeno update failed. Exit code: {exit_code}\n")
-                root.after(0, set_status, f"Deno update failed with exit code {exit_code}")
-                root.after(
-                    0,
-                    messagebox.showwarning,
-                    "Deno update failed",
-                    f"Deno exited with code {exit_code}. Review the output log. "
-                    "The update may have been blocked by ASR or endpoint protection.",
-                )
+                queue_append_log(f"\nDeno update failed. Exit code: {exit_code}\n")
+                safe_after(0, set_status, f"Deno update failed with exit code {exit_code}")
+                queue_append_log("Deno update failed. Review the output log; ASR or endpoint protection may have blocked it.\n")
 
         except Exception as e:
-            root.after(0, set_status, "Deno update error")
-            root.after(0, append_log, f"\nDeno update error: {e}\n")
-            root.after(0, messagebox.showerror, "Deno update error", str(e))
+            safe_after(0, set_status, "Deno update error")
+            queue_append_log(f"\nDeno update error: {e}\n")
+            log_debug_exception("Deno update error", e)
+            queue_append_log("Deno update error. Details were written to gui-debug.log.\n")
 
-    threading.Thread(target=worker, daemon=True).start()
+    start_daemon_thread("worker", worker)
 
 
 
@@ -11006,8 +12019,135 @@ def playlist_preview_tab_is_selected():
         return False
 
 
-def schedule_playlist_preview_autoload(delay_ms=400):
+def playlist_preview_large_list_guard_required(urls):
+    try:
+        count = len(urls or [])
+    except Exception:
+        return False
+
+    if count < URL_PREVIEW_LARGE_LIST_GUARD_THRESHOLD:
+        return False
+
+    try:
+        if playlist_preview_url_limit_once:
+            return False
+    except Exception:
+        pass
+
+    try:
+        if playlist_preview_full_load_approved_signature and playlist_preview_full_load_approved_signature == playlist_preview_source_signature:
+            return False
+    except Exception:
+        pass
+
+    return True
+
+
+def render_playlist_preview_large_list_guard(dialog, urls, silent=False):
+    global playlist_preview_tab_loaded, playlist_preview_loaded_signature
+
+    urls = list(urls or [])
+    count = len(urls)
+
+    try:
+        for child in dialog.winfo_children():
+            child.destroy()
+    except Exception:
+        pass
+
+    try:
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+    except Exception:
+        pass
+
+    frame = ttk.Frame(dialog, padding=18)
+    frame.grid(row=0, column=0, sticky="nsew")
+    frame.columnconfigure(0, weight=1)
+
+    title = "Large Audio/Video Preview list"
+    if count >= URL_PREVIEW_HUGE_LIST_GUARD_THRESHOLD:
+        title = "Very large Audio/Video Preview list"
+
+    ttk.Label(frame, text=title, font=("Segoe UI", 13, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+    message = (
+        f"The current Audio/Video source contains {count:,} URL(s). Building the full preview list and scanning metadata "
+        "can be slow and may increase rate-limit risk. Capturing or queueing can still use the full URL set without opening Preview."
+    )
+    ttk.Label(frame, text=message, wraplength=920, justify="left").grid(row=1, column=0, sticky="ew", pady=(0, 12))
+
+    advice = (
+        "Recommended: use Preview First 25 for a quick spot-check, or Queue All Without Preview for large approved captures. "
+        "Use Load Full Preview List only when you really need to inspect the whole list in the GUI."
+    )
+    ttk.Label(frame, text=advice, wraplength=920, justify="left").grid(row=2, column=0, sticky="ew", pady=(0, 14))
+
+    button_row = ttk.Frame(frame)
+    button_row.grid(row=3, column=0, sticky="w")
+
+    def load_first_sample():
+        global playlist_preview_url_limit_once, playlist_preview_tab_loaded
+        playlist_preview_url_limit_once = min(URL_PREVIEW_FIRST_SAMPLE_COUNT, count)
+        playlist_preview_tab_loaded = False
+        safe_after(0, open_playlist_preview_dialog, False, True)
+
+    def load_full_list():
+        global playlist_preview_full_load_approved_signature, playlist_preview_tab_loaded
+        playlist_preview_full_load_approved_signature = playlist_preview_source_signature
+        playlist_preview_tab_loaded = False
+        safe_after(0, open_playlist_preview_dialog, False, True)
+
+    def queue_all_without_preview():
+        try:
+            if add_urls_to_queue_as_job(urls):
+                append_log(f"\nQueued {len(urls)} URL(s) from large Audio/Video source without loading Preview.\n")
+                open_job_queue(select_tab=True)
+        except Exception as e:
+            messagebox.showerror("Queue failed", str(e))
+
+    def start_without_preview():
+        try:
+            app_notebook.select(main)
+        except Exception:
+            pass
+        start_capture()
+
+    ttk.Button(button_row, text=f"Preview First {min(URL_PREVIEW_FIRST_SAMPLE_COUNT, count)}", command=load_first_sample).pack(side="left", padx=(0, 8))
+    ttk.Button(button_row, text="Load Full Preview List", command=load_full_list).pack(side="left", padx=(0, 8))
+    ttk.Button(button_row, text="Queue All Without Preview", command=queue_all_without_preview).pack(side="left", padx=(0, 8))
+    ttk.Button(button_row, text="Start Capture Without Preview", command=start_without_preview).pack(side="left", padx=(0, 8))
+
+    try:
+        ttk.Label(
+            frame,
+            text="This safeguard only affects the Preview tab. It does not remove or modify the URL box or input file source.",
+            wraplength=920,
+            justify="left",
+        ).grid(row=4, column=0, sticky="ew", pady=(14, 0))
+    except Exception:
+        pass
+
+    try:
+        configure_tk_widget_theme(dialog, get_theme_colors())
+    except Exception:
+        pass
+
+    playlist_preview_tab_loaded = True
+    playlist_preview_loaded_signature = playlist_preview_source_signature
+
+
+def schedule_playlist_preview_autoload(delay_ms=None):
     global playlist_preview_reload_after_id
+
+    if delay_ms is None:
+        delay_ms = URL_BOX_AUTOPREVIEW_DEBOUNCE_MS
+        try:
+            raw_text = urls_text.get("1.0", "end-1c")
+            if raw_text.count("\n") + 1 >= URL_BOX_LARGE_AUTOPREVIEW_LINE_THRESHOLD:
+                delay_ms = URL_BOX_LARGE_AUTOPREVIEW_DEBOUNCE_MS
+        except Exception:
+            pass
 
     try:
         if playlist_preview_reload_after_id:
@@ -11026,7 +12166,10 @@ def schedule_playlist_preview_autoload(delay_ms=400):
 
         if playlist_preview_tab_is_selected():
             try:
-                open_playlist_preview_dialog(silent=True, force_reload=changed)
+                if playlist_preview_large_list_guard_required(playlist_preview_candidate_urls):
+                    render_playlist_preview_large_list_guard(playlist_preview_tab, playlist_preview_candidate_urls, silent=True)
+                else:
+                    open_playlist_preview_dialog(silent=True, force_reload=changed)
             except Exception as e:
                 try:
                     append_log(f"\nAudio/Video Preview auto-load failed: {e}\n")
@@ -11034,10 +12177,9 @@ def schedule_playlist_preview_autoload(delay_ms=400):
                     pass
 
     try:
-        playlist_preview_reload_after_id = root.after(delay_ms, do_refresh)
+        playlist_preview_reload_after_id = safe_after(delay_ms, do_refresh)
     except Exception:
         playlist_preview_reload_after_id = None
-
 
 def handle_playlist_preview_source_changed(event=None):
     try:
@@ -11071,9 +12213,17 @@ def on_notebook_tab_changed(event=None):
 
 def open_playlist_preview_dialog(silent=False, force_reload=False):
     global playlist_preview_tab_loaded, playlist_preview_loaded_signature
+    global playlist_preview_url_limit_once, playlist_preview_full_load_approved_signature
 
     changed = refresh_playlist_preview_candidate_cache()
     urls = list(playlist_preview_candidate_urls)
+    preview_source_total_count = len(urls)
+    preview_limited_note = ""
+    if playlist_preview_url_limit_once:
+        limit = max(1, int(playlist_preview_url_limit_once))
+        urls = urls[:limit]
+        preview_limited_note = f"Loaded first {len(urls)} of {preview_source_total_count} URL(s). "
+        playlist_preview_url_limit_once = 0
     has_preview_urls = bool(urls)
     no_urls_message = (
         "Audio/Video Preview is waiting for URL box or Input File(s) URLs."
@@ -11091,6 +12241,10 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         return
 
     if playlist_preview_tab_loaded and not force_reload and not changed and playlist_preview_loaded_signature == playlist_preview_source_signature:
+        return
+
+    if not preview_limited_note and playlist_preview_large_list_guard_required(urls):
+        render_playlist_preview_large_list_guard(dialog, urls, silent=silent)
         return
 
     for child in dialog.winfo_children():
@@ -11151,7 +12305,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     entry_by_iid = {}
 
     status_var = tk.StringVar(value=(
-        f"Loaded {len(urls)} URL(s). Use Preview All/Checked to gather metadata."
+        f"{preview_limited_note}Loaded {len(urls)} URL(s). Use Preview All/Checked to gather metadata."
         if has_preview_urls else
         f"{no_urls_message} Add URLs in the URL box or select Input File(s) to enable Audio/Video Preview."
     ))
@@ -11250,7 +12404,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         if delay <= 0:
             return
 
-        root.after(0, status_var.set, f"Waiting {delay:.1f}s before next preview URL...")
+        safe_after(0, status_var.set, f"Waiting {delay:.1f}s before next preview URL...")
         append_log(f"Audio/Video preview pacing delay before next URL: {delay:.1f}s\n")
 
         end_time = time.time() + delay
@@ -11953,7 +13107,6 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             return
         root.clipboard_clear()
         root.clipboard_append(text_value)
-        root.update()
         append_log(f"\nCopied {description} to clipboard.\n")
 
     def copy_selected_record_json():
@@ -12249,7 +13402,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         playlist_items_var.set(item_value)
         update_playlist_metadata_visibility()
         update_capture_options_summary()
-        save_settings(show_popup=False)
+        schedule_settings_autosave()
         append_log(f"\nSet Playlist Items from Audio/Video Preview included items: {item_value}\n")
         messagebox.showinfo("Playlist Items set", f"Playlist Items was set to:\n\n{item_value}", parent=dialog)
 
@@ -12383,8 +13536,8 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             if stop_event.is_set():
                 break
             url = record.get("url", "")
-            root.after(0, set_record_status, record, "Scanning")
-            root.after(0, status_var.set, f"Previewing {index}/{total_count}: {url[:140]}")
+            safe_after(0, set_record_status, record, "Scanning")
+            safe_after(0, status_var.set, f"Previewing {index}/{total_count}: {url[:140]}")
             try:
                 cmd = build_ytdlp_common_metadata_args(url, include_playlist_mode=True)
                 append_log(f"\nAudio/Video Preview metadata scan {index}/{total_count}:\n{format_command_for_log(cmd)}\n")
@@ -12398,27 +13551,27 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
                 combined_output = "\n".join(part for part in [result.stdout, result.stderr] if part)
                 backoff_reason = detect_preview_backoff_reason(combined_output)
                 if backoff_reason:
-                    root.after(0, add_preview_error, record, "Backoff", backoff_reason)
-                    root.after(0, show_preview_backoff_warning, url, backoff_reason)
+                    safe_after(0, add_preview_error, record, "Backoff", backoff_reason)
+                    safe_after(0, show_preview_backoff_warning, url, backoff_reason)
                     stop_event.set()
                     break
                 if result.returncode != 0:
                     detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
-                    root.after(0, add_preview_error, record, "Failed", detail)
+                    safe_after(0, add_preview_error, record, "Failed", detail)
                     sleep_before_next_preview_url(index, total_count)
                     continue
                 data = extract_json_object_from_stdout(result.stdout)
-                root.after(0, normalized_info_record, record, data)
-                root.after(0, update_url_tree_row, record.get("iid", ""))
+                safe_after(0, normalized_info_record, record, data)
+                safe_after(0, update_url_tree_row, record.get("iid", ""))
             except Exception as e:
                 message_text = str(e)
                 backoff_reason = detect_preview_backoff_reason(message_text)
                 if backoff_reason:
-                    root.after(0, add_preview_error, record, "Backoff", backoff_reason)
-                    root.after(0, show_preview_backoff_warning, url, backoff_reason)
+                    safe_after(0, add_preview_error, record, "Backoff", backoff_reason)
+                    safe_after(0, show_preview_backoff_warning, url, backoff_reason)
                     stop_event.set()
                     break
-                root.after(0, add_preview_error, record, "Error", message_text)
+                safe_after(0, add_preview_error, record, "Error", message_text)
             sleep_before_next_preview_url(index, total_count)
 
         def finish():
@@ -12436,7 +13589,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
                 status_var.set(f"Audio/Video preview complete. {previewed_count}/{len(url_records)} URL(s) have metadata.")
             append_log(f"\nAudio/Video preview finished. {previewed_count}/{len(url_records)} URL(s) have metadata.\n")
 
-        root.after(0, finish)
+        safe_after(0, finish)
 
     def start_preview(selected_only=False, explicit_records=None):
         if scan_running["value"]:
@@ -12469,7 +13622,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             f"\nStarting Audio/Video preview for {len(scan_records)} URL(s). "
             f"Pacing: {pacing_var.get()}; thumbnail mode: {thumbnail_mode_var.get()}; playlist mode: {playlist_mode_var.get()}.\n"
         )
-        threading.Thread(target=lambda: scan_worker(scan_records), daemon=True).start()
+        start_daemon_thread("audio_video_preview_scan", scan_worker, scan_records)
 
     def stop_preview():
         stop_event.set()
@@ -12751,8 +13904,8 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             with thumbnail_state_lock:
                 visible_record = thumbnail_state.get("desired_record")
             if visible_record and current_detail_record.get("record") is visible_record:
-                root.after(0, set_thumbnail_status, f"Rate-limited {label}; fetching in {remaining:.1f}s...")
-                root.after(0, lambda r=remaining, l=label: thumbnail_label.configure(image="", text=f"Rate-limited {l}\n{r:.1f}s"))
+                safe_after(0, set_thumbnail_status, f"Rate-limited {label}; fetching in {remaining:.1f}s...")
+                safe_after(0, lambda r=remaining, l=label: thumbnail_label.configure(image="", text=f"Rate-limited {l}\n{r:.1f}s"))
             time.sleep(min(0.25, max(0.0, remaining)))
 
         return thumbnail_desired_key() == key
@@ -12778,7 +13931,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
                 return "", "superseded"
             did_attempt = False
             try:
-                root.after(0, set_thumbnail_status, "Fetching thumbnail from metadata URL...")
+                safe_after(0, set_thumbnail_status, "Fetching thumbnail from metadata URL...")
                 did_attempt = True
                 path = fetch_thumbnail_fast(record)
                 return path, ""
@@ -12796,7 +13949,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
                 return "", "superseded"
             did_attempt = False
             try:
-                root.after(0, set_thumbnail_status, "Fetching thumbnail with yt-dlp fallback...")
+                safe_after(0, set_thumbnail_status, "Fetching thumbnail with yt-dlp fallback...")
                 did_attempt = True
                 path = fetch_thumbnail_ytdlp(record)
                 return path, ""
@@ -12819,18 +13972,18 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
 
                 cached_path = record.get("thumbnail_cache_path")
                 if cached_path and os.path.isfile(cached_path):
-                    root.after(0, load_thumbnail_image, record, cached_path)
+                    safe_after(0, load_thumbnail_image, record, cached_path)
                     return
 
                 if thumbnail_mode_var.get() == "Off":
                     if thumbnail_desired_key() == key and current_detail_record.get("record") is record:
-                        root.after(0, clear_thumbnail, "Thumbnail fetching is off", "")
+                        safe_after(0, clear_thumbnail, "Thumbnail fetching is off", "")
                     return
 
                 record["thumbnail_status"] = "Fetching"
-                root.after(0, update_preview_row, record)
+                safe_after(0, update_preview_row, record)
                 if thumbnail_desired_key() == key and current_detail_record.get("record") is record:
-                    root.after(0, clear_thumbnail, "Preparing thumbnail fetch...", "")
+                    safe_after(0, clear_thumbnail, "Preparing thumbnail fetch...", "")
 
                 path, error = fetch_thumbnail_for_record_with_rate_limits(record, key)
 
@@ -12844,7 +13997,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
                 else:
                     record["thumbnail_status"] = "Fetch failed"
                     record["thumbnail_error"] = error
-                root.after(0, apply_thumbnail_fetch_result, record, key, path, error)
+                safe_after(0, apply_thumbnail_fetch_result, record, key, path, error)
                 return
         finally:
             restart_needed = False
@@ -12857,14 +14010,14 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
                     if not cached and record.get("thumbnail_status") in {"Waiting", "Fetching"}:
                         restart_needed = True
             if restart_needed:
-                root.after(0, ensure_thumbnail_worker)
+                safe_after(0, ensure_thumbnail_worker)
 
     def ensure_thumbnail_worker():
         with thumbnail_state_lock:
             if thumbnail_state.get("worker_running"):
                 return
             thumbnail_state["worker_running"] = True
-        threading.Thread(target=thumbnail_worker_loop, daemon=True).start()
+        start_daemon_thread("audio_video_preview_thumbnail", thumbnail_worker_loop)
 
     def begin_thumbnail_fetch(record):
         mode = thumbnail_mode_var.get()
@@ -13403,7 +14556,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
 
     update_action_states()
     if has_preview_urls:
-        status_var.set(f"Loaded {len(urls)} URL(s). Use Preview All/Checked to gather metadata; Include checkmarks control Start/Queue Included actions.")
+        status_var.set(f"{preview_limited_note}Loaded {len(urls)} URL(s). Use Preview All/Checked to gather metadata; Include checkmarks control Start/Queue Included actions.")
     else:
         status_var.set(f"{no_urls_message} Add URLs in the URL box or select Input File(s) to enable Audio/Video Preview.")
 
@@ -13452,15 +14605,16 @@ def check_impersonate_targets():
                 if is_valid_impersonate_target_label(target) and target not in values:
                     values.append(target)
 
-            root.after(0, update_impersonate_menu, values)
-            root.after(0, target_status_var.set, f"Impersonate targets: Found {len(values) - 1} {target_label}")
-            root.after(0, append_log, f"\n{log_title}:\n" + "\n".join(values) + "\n")
+            safe_after(0, update_impersonate_menu, values)
+            safe_after(0, target_status_var.set, f"Impersonate targets: Found {len(values) - 1} {target_label}")
+            queue_append_log(f"\n{log_title}:\n" + "\n".join(values) + "\n")
 
         except Exception as e:
-            root.after(0, target_status_var.set, "Impersonate targets: Check failed")
-            root.after(0, messagebox.showerror, "Impersonate check failed", str(e))
+            safe_after(0, target_status_var.set, "Impersonate targets: Check failed")
+            log_debug_exception("Impersonate target check failed", e)
+            queue_append_log(f"\nImpersonate target check failed: {e}\n")
 
-    threading.Thread(target=worker, daemon=True).start()
+    start_daemon_thread("worker", worker)
 
 
 def is_valid_impersonate_target_label(value):
@@ -13835,7 +14989,7 @@ def export_browser_cookies(browser, output_cookie_file, update_main_cookie_path=
             if result.stdout:
                 for line in result.stdout:
                     output_lines.append(line)
-                    root.after(0, append_log, line)
+                    queue_append_log(line)
 
             exit_code = result.wait()
             combined_output = "".join(output_lines)
@@ -13850,25 +15004,25 @@ def export_browser_cookies(browser, output_cookie_file, update_main_cookie_path=
 
             if cookies_exported:
                 if cookies_file_exists and update_main_cookie_path:
-                    root.after(0, cookies_file_var.set, output_cookie_file)
-                    root.after(0, save_settings, False)
+                    safe_after(0, cookies_file_var.set, output_cookie_file)
+                    safe_after(0, schedule_settings_autosave)
 
                 if exit_code == 0:
-                    root.after(0, set_status, "Browser cookies exported")
-                    root.after(
+                    safe_after(0, set_status, "Browser cookies exported")
+                    safe_after(
                         0,
-                        messagebox.showinfo,
-                        "Cookies exported",
-                        f"Cookies exported to:\n\n{output_cookie_file}\n\n"
+                        append_log,
+                        "Cookies exported. No confirmation dialog was shown.\n"
+                        f"Cookies file: {output_cookie_file}\n"
                         + (
-                            "The Cookies File field has been updated."
+                            "The Cookies File field has been updated.\n"
                             if cookies_file_exists and update_main_cookie_path
-                            else "The Cookies File field was not changed."
+                            else "The Cookies File field was not changed.\n"
                         ),
                     )
                 else:
-                    root.after(0, set_status, f"Browser cookies exported; yt-dlp exited with code {exit_code}")
-                    root.after(
+                    safe_after(0, set_status, f"Browser cookies exported; yt-dlp exited with code {exit_code}")
+                    safe_after(
                         0,
                         append_log,
                         f"\nCookie export appears successful, but yt-dlp exited with code {exit_code} "
@@ -13876,31 +15030,27 @@ def export_browser_cookies(browser, output_cookie_file, update_main_cookie_path=
                     )
 
                     if cookies_file_exists and update_main_cookie_path:
-                        root.after(
+                        safe_after(
                             0,
                             append_log,
                             f"Main Cookies File field updated to: {output_cookie_file}\n",
                         )
                     elif not update_main_cookie_path:
-                        root.after(
+                        safe_after(
                             0,
                             append_log,
                             "Main Cookies File field was not changed because the export dialog checkbox was unchecked.\n",
                         )
             else:
-                root.after(0, set_status, f"Cookie export failed with exit code {exit_code}")
-                root.after(
-                    0,
-                    messagebox.showwarning,
-                    "Cookie export failed",
-                    f"yt-dlp exited with code {exit_code}, and no non-empty cookies file was created. Review the output log.",
-                )
+                safe_after(0, set_status, f"Cookie export failed with exit code {exit_code}")
+                queue_append_log(f"Cookie export failed with exit code {exit_code}; no non-empty cookies file was created. Review the output log.\n")
 
         except Exception as e:
-            root.after(0, set_status, "Cookie export error")
-            root.after(0, messagebox.showerror, "Cookie export error", str(e))
+            safe_after(0, set_status, "Cookie export error")
+            log_debug_exception("Cookie export error", e)
+            queue_append_log("Cookie export error. Details were written to gui-debug.log.\n")
 
-    threading.Thread(target=worker, daemon=True).start()
+    start_daemon_thread("worker", worker)
 
 
 
@@ -14513,7 +15663,7 @@ def hide_capture_options_panel(save=False):
 
     if save:
         update_capture_options_summary()
-        save_settings(show_popup=False)
+        schedule_settings_autosave()
 
 
 def hide_metadata_options_panel(save=False):
@@ -14527,7 +15677,7 @@ def hide_metadata_options_panel(save=False):
 
     if save:
         update_capture_options_summary()
-        save_settings(show_popup=False)
+        schedule_settings_autosave()
 
 
 def hide_advanced_options_panel(save=False):
@@ -14541,7 +15691,7 @@ def hide_advanced_options_panel(save=False):
 
     if save:
         update_capture_options_summary()
-        save_settings(show_popup=False)
+        schedule_settings_autosave()
 
 
 def hide_pacing_options_panel(save=False):
@@ -14555,7 +15705,7 @@ def hide_pacing_options_panel(save=False):
 
     if save:
         update_capture_options_summary()
-        save_settings(show_popup=False)
+        schedule_settings_autosave()
 
 
 def toggle_capture_options_panel():
@@ -15306,6 +16456,267 @@ class TreeviewHoverTooltip:
             self.window = None
 
 
+class LazyTreeviewThumbnailPreview:
+    """Lazy hover preview for large Case Browser compact lists.
+
+    Compact View intentionally avoids creating thumbnail widgets for every row.
+    This helper waits until the pointer rests over a media row, shows one small
+    tooltip, and generates/loads only that row's preview. Stale hover results
+    are ignored if the user moves away, scrolls, changes folders, or the active
+    Case Browser generation changes while the worker is still running.
+    """
+
+    def __init__(
+        self,
+        tree,
+        path_provider,
+        context_is_active,
+        delay=CASE_BROWSER_COMPACT_PREVIEW_DELAY_MS,
+        max_width=CASE_BROWSER_COMPACT_PREVIEW_MAX_WIDTH,
+        max_height=CASE_BROWSER_COMPACT_PREVIEW_MAX_HEIGHT,
+        wraplength=CASE_BROWSER_COMPACT_PREVIEW_WRAP,
+    ):
+        self.tree = tree
+        self.path_provider = path_provider
+        self.context_is_active = context_is_active
+        self.delay = delay
+        self.max_width = max_width
+        self.max_height = max_height
+        self.wraplength = wraplength
+        self.after_id = None
+        self.window = None
+        self.current_item = ""
+        self.current_path = ""
+        self.last_event = None
+        self.request_id = 0
+        self.image_ref = None
+        self.loading_label = None
+        self.image_label = None
+        self.detail_label = None
+
+        tree.bind("<Motion>", self.on_motion, add="+")
+        tree.bind("<Leave>", self.hide, add="+")
+        tree.bind("<ButtonPress>", self.hide, add="+")
+        tree.bind("<MouseWheel>", self.hide, add="+")
+        tree.bind("<Shift-MouseWheel>", self.hide, add="+")
+
+    def on_motion(self, event):
+        if APP_CLOSING or not self._context_is_active():
+            self.hide()
+            return
+
+        item = self.tree.identify_row(event.y)
+        self.last_event = event
+
+        if item == self.current_item:
+            return
+
+        self.hide()
+        self.current_item = item
+        self.current_path = ""
+
+        if not item:
+            return
+
+        try:
+            path = self.path_provider(item)
+        except Exception as e:
+            log_debug_exception("Compact preview path lookup failed", e)
+            path = ""
+
+        if not path or not is_browser_media_file(path):
+            return
+
+        self.current_path = path
+        self.after_id = self.tree.after(self.delay, self.show_loading)
+
+    def _context_is_active(self):
+        try:
+            return bool(self.context_is_active())
+        except Exception as e:
+            log_debug_exception("Compact preview context check failed", e)
+            return False
+
+    def cancel(self):
+        if self.after_id:
+            try:
+                self.tree.after_cancel(self.after_id)
+            except Exception:
+                pass
+            self.after_id = None
+
+    def hide(self, event=None):
+        self.cancel()
+        self.request_id += 1
+        self.current_item = ""
+        self.current_path = ""
+        self.image_ref = None
+        self.loading_label = None
+        self.image_label = None
+        self.detail_label = None
+
+        if self.window:
+            try:
+                self.window.destroy()
+            except Exception:
+                pass
+            self.window = None
+
+    def show_loading(self):
+        self.cancel()
+
+        if APP_CLOSING or not self._context_is_active() or not self.current_path:
+            return
+
+        path = self.current_path
+        self.request_id += 1
+        request_id = self.request_id
+
+        try:
+            event = self.last_event
+            x = event.x_root + 18
+            y = event.y_root + 18
+        except Exception:
+            x = self.tree.winfo_rootx() + 20
+            y = self.tree.winfo_rooty() + 40
+
+        self.window = tk.Toplevel(self.tree)
+        self.window.wm_overrideredirect(True)
+        self.window.wm_geometry(f"+{x}+{y}")
+
+        frame = ttk.Frame(self.window, padding=8, relief="solid", borderwidth=1)
+        frame.pack(fill="both", expand=True)
+
+        self.loading_label = ttk.Label(
+            frame,
+            text=f"Preview loading...\n{os.path.basename(path)}",
+            justify="left",
+            wraplength=self.wraplength,
+        )
+        self.loading_label.pack(anchor="w")
+        self.image_label = ttk.Label(frame)
+        self.detail_label = ttk.Label(frame, justify="left", wraplength=self.wraplength)
+
+        ffprobe_exe = get_ffprobe_executable_for_gui()
+        ffmpeg_exe = get_ffmpeg_executable_for_gui()
+
+        def worker():
+            acquired = False
+            media_info = {}
+            thumbnail_path = ""
+            error_text = ""
+
+            try:
+                case_browser_media_probe_semaphore.acquire()
+                acquired = True
+
+                if APP_CLOSING or not self._context_is_active() or request_id != self.request_id or path != self.current_path:
+                    return
+
+                if is_browser_video_file(path) or is_browser_audio_file(path):
+                    try:
+                        media_info = load_or_generate_media_info_with_exe(path, ffprobe_exe)
+                    except Exception as e:
+                        log_debug_exception(f"Compact preview media info failed: {path}", e)
+                        media_info = {}
+
+                if APP_CLOSING or not self._context_is_active() or request_id != self.request_id or path != self.current_path:
+                    return
+
+                try:
+                    thumbnail_path = generate_case_browser_thumbnail_with_exe(path, ffmpeg_exe)
+                except Exception as e:
+                    log_debug_exception(f"Compact preview thumbnail failed: {path}", e)
+                    thumbnail_path = ""
+
+            except Exception as e:
+                log_debug_exception(f"Compact preview worker failed: {path}", e)
+                error_text = str(e)
+            finally:
+                if acquired:
+                    try:
+                        case_browser_media_probe_semaphore.release()
+                    except Exception as e:
+                        log_debug_exception("Compact preview semaphore release failed", e)
+
+            def apply_result(p=path, req=request_id, info=media_info, thumb=thumbnail_path, err=error_text):
+                self.apply_result(req, p, info, thumb, err)
+
+            enqueue_case_browser_ui(apply_result)
+
+        start_daemon_thread("case_browser_compact_hover_preview", worker)
+
+    def apply_result(self, request_id, path, media_info, thumbnail_path, error_text=""):
+        if (
+            APP_CLOSING
+            or not self._context_is_active()
+            or request_id != self.request_id
+            or path != self.current_path
+            or not self.window
+        ):
+            return
+
+        detail_lines = [os.path.basename(path)]
+        try:
+            size = os.path.getsize(path)
+            size_text = format_bytes_for_display(size)
+            if size_text:
+                detail_lines.append(f"Size: {size_text}")
+        except Exception:
+            pass
+
+        if is_browser_video_file(path) or is_browser_audio_file(path):
+            try:
+                summary = get_media_info_summary(media_info, path)
+                tooltip = summary.get("tooltip") or ""
+                if tooltip:
+                    detail_lines = tooltip.splitlines()
+            except Exception as e:
+                log_debug_exception("Compact preview media summary failed", e)
+
+        try:
+            rel_path = os.path.relpath(path, output_root_var.get().strip())
+            if rel_path and rel_path != path:
+                if "Path:" not in "\n".join(detail_lines):
+                    detail_lines.extend(["", f"Path: {rel_path}"])
+        except Exception:
+            pass
+
+        if error_text:
+            detail_lines.append(f"Preview error: {error_text}")
+
+        preview_loaded = False
+        if thumbnail_path and os.path.isfile(thumbnail_path):
+            try:
+                image = tk.PhotoImage(file=thumbnail_path)
+                factor = max(
+                    1,
+                    int(math.ceil(max(image.width() / self.max_width, image.height() / self.max_height))),
+                )
+                if factor > 1:
+                    image = image.subsample(factor, factor)
+                self.image_ref = image
+                if self.image_label:
+                    self.image_label.configure(image=image)
+                    self.image_label.pack(anchor="center", pady=(0, 8))
+                preview_loaded = True
+            except Exception as e:
+                log_debug_exception(f"Compact preview image load failed: {thumbnail_path}", e)
+
+        if self.loading_label:
+            try:
+                self.loading_label.pack_forget()
+            except Exception:
+                pass
+
+        if self.detail_label:
+            if not preview_loaded and (is_browser_video_file(path) or is_browser_image_file(path)):
+                detail_lines.append("Preview unavailable.")
+            self.detail_label.configure(text="\n".join(detail_lines))
+            self.detail_label.pack(anchor="w")
+
+
+
 BROWSER_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
 BROWSER_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".opus", ".wav", ".aac", ".flac"}
 BROWSER_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".avif"}
@@ -15328,38 +16739,52 @@ def is_browser_media_file(path):
 
 
 def enqueue_case_browser_ui(callback):
+    if APP_CLOSING:
+        return
+
     try:
         case_browser_result_queue.put(callback)
-    except Exception:
-        pass
+    except Exception as e:
+        log_debug_exception("Could not enqueue Case Browser UI callback", e)
 
 
 def process_case_browser_result_queue():
     global case_browser_result_poller_running
 
+    if APP_CLOSING:
+        case_browser_result_poller_running = False
+        return
+
     case_browser_result_poller_running = True
 
+    processed = 0
+
     try:
-        while True:
+        while processed < CASE_BROWSER_UI_CALLBACKS_PER_TICK:
             callback = case_browser_result_queue.get_nowait()
+            processed += 1
             try:
                 callback()
             except Exception as e:
                 try:
-                    append_log(f"\nCase Browser UI update failed: {e}\n")
+                    queue_append_log(f"\nCase Browser UI update failed: {e}\n")
                 except Exception:
                     pass
     except queue.Empty:
         pass
     except Exception as e:
         try:
-            append_log(f"\nCase Browser result queue failed: {e}\n")
+            queue_append_log(f"\nCase Browser result queue failed: {e}\n")
         except Exception:
             pass
 
     try:
-        root.after(100, process_case_browser_result_queue)
-    except Exception:
+        delay = 25 if not case_browser_result_queue.empty() else 100
+        after_id = safe_after(delay, process_case_browser_result_queue)
+        if after_id is None and APP_CLOSING:
+            case_browser_result_poller_running = False
+    except Exception as e:
+        log_debug_exception("Case Browser result poller scheduling failed", e)
         case_browser_result_poller_running = False
 
 
@@ -15370,7 +16795,7 @@ def start_case_browser_result_poller():
         return
 
     try:
-        root.after(100, process_case_browser_result_queue)
+        safe_after(100, process_case_browser_result_queue)
         case_browser_result_poller_running = True
     except Exception:
         case_browser_result_poller_running = False
@@ -15414,7 +16839,7 @@ def schedule_case_browser_autoload(delay_ms=500):
             append_log(f"\nCase Browser auto-load failed: {e}\n")
 
     try:
-        case_browser_reload_after_id = root.after(delay_ms, do_reload)
+        case_browser_reload_after_id = safe_after(delay_ms, do_reload)
     except Exception:
         case_browser_reload_after_id = None
 
@@ -15497,8 +16922,12 @@ def open_case_browser(select_tab=True, silent=False):
     browser_sort_var = case_browser_sort_var
     browser_current_only_var = case_browser_current_only_var
     browser_icon_scale_var = case_browser_icon_scale_var
+    browser_view_mode_var = tk.StringVar(value="Auto")
     browser_search_var = tk.StringVar(value="")
     browser_search_after_id = {"value": None}
+    case_browser_card_limit_state = {"key": None, "value": CASE_BROWSER_CARD_INITIAL_LIMIT}
+    case_browser_content_mode = {"value": "empty"}
+    case_browser_card_rendering_state = {"value": False}
 
     def save_case_browser_preferences():
         save_app_settings(show_popup=False)
@@ -15517,7 +16946,7 @@ def open_case_browser(select_tab=True, silent=False):
                 root.after_cancel(browser_search_after_id["value"])
         except Exception:
             pass
-        browser_search_after_id["value"] = root.after(250, refresh_browser_view)
+        browser_search_after_id["value"] = safe_after(250, refresh_browser_view)
 
     def get_browser_icon_geometry():
         scale = browser_icon_scale_var.get()
@@ -15606,6 +17035,13 @@ def open_case_browser(select_tab=True, silent=False):
         return max(1, usable_width // card_pitch)
 
     def schedule_case_browser_reflow_if_needed(event=None):
+        if case_browser_card_rendering_state.get("value"):
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
+            return
+
         try:
             geometry = get_browser_icon_geometry()
             new_columns = get_dynamic_browser_columns(geometry, getattr(event, "width", None))
@@ -15632,14 +17068,14 @@ def open_case_browser(select_tab=True, silent=False):
             except Exception:
                 pass
 
-        case_browser_reflow_after_id["value"] = root.after(200, do_reflow)
+        case_browser_reflow_after_id["value"] = safe_after(200, do_reflow)
 
     ttk.Label(right_frame, textvariable=browser_status_var).grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
     browser_controls = ttk.Frame(right_frame)
     browser_controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-    browser_controls.columnconfigure(5, weight=1)
     browser_controls.columnconfigure(1, weight=1)
+    browser_controls.columnconfigure(5, weight=1)
 
     ttk.Label(browser_controls, text="Filter").grid(row=0, column=0, sticky="w", padx=(0, 4))
     filter_menu = ttk.Combobox(
@@ -15678,13 +17114,29 @@ def open_case_browser(select_tab=True, silent=False):
     )
     scale_menu.grid(row=0, column=6, sticky="e")
 
-    ttk.Label(browser_controls, text="Search").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
+    ttk.Label(browser_controls, text="View").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
+    view_menu = ttk.Combobox(
+        browser_controls,
+        textvariable=browser_view_mode_var,
+        values=["Auto", "Cards", "Compact"],
+        state="readonly",
+        width=10,
+    )
+    view_menu.grid(row=1, column=1, sticky="w", padx=(0, 8), pady=(6, 0))
+
+    ttk.Label(browser_controls, text="Search").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
     browser_search_entry = ttk.Entry(browser_controls, textvariable=browser_search_var)
-    browser_search_entry.grid(row=1, column=1, columnspan=5, sticky="ew", padx=(0, 8), pady=(6, 0))
-    ttk.Button(browser_controls, text="Clear", command=lambda: browser_search_var.set("")).grid(row=1, column=6, sticky="e", pady=(6, 0))
+    browser_search_entry.grid(row=2, column=1, columnspan=5, sticky="ew", padx=(0, 8), pady=(6, 0))
+    ttk.Button(browser_controls, text="Clear", command=lambda: browser_search_var.set("")).grid(row=2, column=6, sticky="e", pady=(6, 0))
     browser_search_var.trace_add("write", schedule_browser_search_refresh)
 
-    canvas = tk.Canvas(right_frame, highlightthickness=0)
+    try:
+        browser_theme_colors = get_theme_colors()
+        browser_canvas_bg = browser_theme_colors.get("bg", "#F0F0F0")
+    except Exception:
+        browser_canvas_bg = "#F0F0F0"
+
+    canvas = tk.Canvas(right_frame, highlightthickness=0, bg=browser_canvas_bg)
     canvas.grid(row=2, column=0, sticky="nsew")
 
     y_scroll = ttk.Scrollbar(right_frame, orient="vertical", command=canvas.yview)
@@ -15696,22 +17148,78 @@ def open_case_browser(select_tab=True, silent=False):
     canvas.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
 
     content_frame = ttk.Frame(canvas)
+    mark_theme_dynamic_container(content_frame)
     content_window = canvas.create_window((0, 0), window=content_frame, anchor="nw")
 
-    def configure_content(event=None):
-        canvas.configure(scrollregion=canvas.bbox("all"))
-
-    def configure_canvas(event):
-        # Keep the file-card surface aligned to the visible pane width. The
-        # column count is recalculated separately, so the content should not
-        # force horizontal scrolling just because the window was narrowed.
+    def set_case_browser_outer_scrollbars(enabled):
         try:
-            canvas.itemconfigure(content_window, width=max(1, event.width))
+            if enabled:
+                y_scroll.grid(row=2, column=1, sticky="ns")
+                x_scroll.grid(row=3, column=0, sticky="ew")
+                canvas.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+            else:
+                y_scroll.grid_remove()
+                x_scroll.grid_remove()
+                canvas.configure(yscrollcommand=lambda *args: None, xscrollcommand=lambda *args: None)
+        except Exception as e:
+            log_debug_exception("Case Browser scrollbar toggle failed", e)
+
+    def sync_case_browser_canvas_layout(event=None):
+        """Keep the Case Browser canvas window sized for the active view mode.
+
+        Compact/summary/empty views should fill the visible file pane. Card
+        view must *not* keep the previous fixed height from those modes; if the
+        canvas window height stays locked to the viewport, the scrollregion
+        never grows and mouse-wheel/scrollbar scrolling appears broken even
+        though card widgets continue to render below the fold.
+        """
+        try:
+            canvas_width = int(getattr(event, "width", 0) or canvas.winfo_width())
+        except Exception:
+            canvas_width = 1
+        try:
+            canvas_height = int(getattr(event, "height", 0) or canvas.winfo_height())
+        except Exception:
+            canvas_height = 1
+
+        item_options = {"width": max(1, canvas_width)}
+        if case_browser_content_mode.get("value") in {"compact", "summary", "empty"}:
+            item_options["height"] = max(1, canvas_height)
+        else:
+            # Release any fixed height left behind by compact/summary/empty
+            # mode so the embedded frame can request its true card height.
+            item_options["height"] = 0
+
+        try:
+            canvas.itemconfigure(content_window, **item_options)
+        except Exception as e:
+            log_debug_exception("Case Browser canvas window sizing failed", e)
+
+    def sync_case_browser_scrollregion():
+        try:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        except Exception as e:
+            log_debug_exception("Case Browser scrollregion update failed", e)
+
+    def configure_content(event=None):
+        sync_case_browser_canvas_layout()
+        sync_case_browser_scrollregion()
+        try:
+            safe_after(25, sync_case_browser_scrollregion)
         except Exception:
             pass
 
-        canvas.configure(scrollregion=canvas.bbox("all"))
-        schedule_case_browser_reflow_if_needed(event)
+    def configure_canvas(event):
+        sync_case_browser_canvas_layout(event)
+
+        try:
+            current_colors = get_theme_colors()
+            canvas.configure(bg=current_colors.get("bg", browser_canvas_bg))
+        except Exception:
+            pass
+        sync_case_browser_scrollregion()
+        if case_browser_content_mode.get("value") == "cards":
+            schedule_case_browser_reflow_if_needed(event)
 
     content_frame.bind("<Configure>", configure_content)
     canvas.bind("<Configure>", configure_canvas)
@@ -15778,7 +17286,7 @@ def open_case_browser(select_tab=True, silent=False):
                     inserted_count += 1
 
                 if stack:
-                    root.after(1, process_batch)
+                    safe_after(1, process_batch)
                 elif on_done:
                     on_done()
             except Exception as e:
@@ -15854,16 +17362,51 @@ def open_case_browser(select_tab=True, silent=False):
             menu.grab_release()
 
     def make_placeholder(parent, extension, width=160, height=100, font_big=14, font_small=9):
-        placeholder = tk.Canvas(parent, width=width, height=height, highlightthickness=1, relief="ridge")
-        placeholder.create_rectangle(0, 0, width, height)
-        placeholder.create_text(width // 2, height // 2 - 8, text=(extension or "FILE").upper(), font=("Segoe UI", font_big, "bold"))
-        placeholder.create_text(width // 2, height // 2 + 18, text="No preview", font=("Segoe UI", font_small))
+        try:
+            colors = get_theme_colors()
+            bg = colors.get("panel", "#F0F0F0")
+            fg = colors.get("muted", "#333333")
+            border = colors.get("border", "#D0D0D0")
+        except Exception:
+            bg = "#F0F0F0"
+            fg = "#333333"
+            border = "#D0D0D0"
+
+        placeholder = tk.Canvas(
+            parent,
+            width=width,
+            height=height,
+            highlightthickness=1,
+            highlightbackground=border,
+            bg=bg,
+            relief="ridge",
+        )
+        placeholder.create_rectangle(0, 0, width, height, outline=border)
+        placeholder.create_text(width // 2, height // 2 - 8, text=(extension or "FILE").upper(), font=("Segoe UI", font_big, "bold"), fill=fg)
+        placeholder.create_text(width // 2, height // 2 + 18, text="No preview", font=("Segoe UI", font_small), fill=fg)
         return placeholder
 
-    def clear_content():
+    def clear_content(mode="empty"):
+        file_render_generation["value"] += 1
+        case_browser_card_rendering_state["value"] = False
+        case_browser_content_mode["value"] = mode
+        set_case_browser_outer_scrollbars(mode == "cards")
+        try:
+            canvas.yview_moveto(0)
+            canvas.xview_moveto(0)
+        except Exception:
+            pass
         for child in content_frame.winfo_children():
             child.destroy()
         image_refs.clear()
+        try:
+            for column_index in range(12):
+                content_frame.columnconfigure(column_index, weight=0, uniform="")
+            for row_index in range(12):
+                content_frame.rowconfigure(row_index, weight=0)
+        except Exception:
+            pass
+        configure_content()
 
     def get_browser_sort_domain(path, folder_path):
         try:
@@ -15997,11 +17540,55 @@ def open_case_browser(select_tab=True, silent=False):
 
         return display_files, total_after_type_filter
 
-    def render_file_cards(folder_path, files, total_count=None, search_query="", selected_filter="All"):
-        clear_content()
+    def get_case_browser_file_type_label(path):
+        ext = os.path.splitext(path)[1].lower()
+        if is_browser_video_file(path):
+            return "Video"
+        if is_browser_audio_file(path):
+            return "Audio"
+        if is_browser_image_file(path):
+            return "Image"
+        if ext in {".json", ".csv"}:
+            return "Metadata"
+        if ext in {".log", ".txt", ".description"}:
+            return "Text/Log"
+        if ext in {".srt", ".vtt"}:
+            return "Subtitle"
+        if ext in {".url", ".webloc"}:
+            return "Source Link"
+        return ext.lstrip(".").upper() if ext else "File"
+
+    def get_case_browser_file_size(path):
+        try:
+            return format_bytes_for_display(os.path.getsize(path))
+        except Exception:
+            return ""
+
+    def get_case_browser_modified_time(path):
+        try:
+            return datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return ""
+
+    def reset_case_browser_card_limit_if_context_changed(folder_path, files, search_query, selected_filter):
+        key = (
+            os.path.normcase(os.path.abspath(folder_path)),
+            selected_filter,
+            bool(browser_current_only_var.get()),
+            browser_sort_var.get(),
+            str(search_query or ""),
+            len(files),
+        )
+        if case_browser_card_limit_state.get("key") != key:
+            case_browser_card_limit_state["key"] = key
+            case_browser_card_limit_state["value"] = CASE_BROWSER_CARD_INITIAL_LIMIT
+        return key
+
+    def render_compact_file_list(folder_path, files, total_count=None, search_query="", selected_filter="All", note=""):
+        clear_content("compact")
         render_generation = file_render_generation["value"]
         total_count = len(files) if total_count is None else total_count
-        browser_status_var.set(f"{folder_path} - {len(files)} shown / {total_count} file(s)")
+        browser_status_var.set(f"{folder_path} - compact list showing {len(files)} / {total_count} file(s)")
 
         if not files:
             if str(search_query or "").strip():
@@ -16015,6 +17602,224 @@ def open_case_browser(select_tab=True, silent=False):
             ttk.Label(content_frame, text=message).grid(row=0, column=0, sticky="w", padx=12, pady=12)
             return
 
+        content_frame.columnconfigure(0, weight=1)
+        content_frame.rowconfigure(0, weight=0)
+        content_frame.rowconfigure(1, weight=1)
+        try:
+            canvas.itemconfigure(content_window, width=max(1, canvas.winfo_width()), height=max(1, canvas.winfo_height()))
+        except Exception:
+            pass
+
+
+        summary_text = note or f"Compact list mode is shown for {len(files)} file(s). Double-click a row to open it; right-click for actions."
+        ttk.Label(content_frame, text=summary_text, wraplength=900, justify="left").grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+
+        list_frame = ttk.Frame(content_frame)
+        list_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        columns = ("type", "size", "modified", "relative_path")
+        file_tree = ttk.Treeview(list_frame, columns=columns, show="tree headings", selectmode="extended")
+        file_tree.heading("#0", text="Name")
+        file_tree.heading("type", text="Type")
+        file_tree.heading("size", text="Size")
+        file_tree.heading("modified", text="Modified")
+        file_tree.heading("relative_path", text="Relative Path")
+        file_tree.column("#0", width=260, minwidth=160, stretch=True)
+        file_tree.column("type", width=90, minwidth=70, anchor="w", stretch=False)
+        file_tree.column("size", width=90, minwidth=70, anchor="e", stretch=False)
+        file_tree.column("modified", width=140, minwidth=110, anchor="w", stretch=False)
+        file_tree.column("relative_path", width=420, minwidth=180, anchor="w", stretch=True)
+        file_tree.grid(row=0, column=0, sticky="nsew")
+
+        ybar = ttk.Scrollbar(list_frame, orient="vertical", command=file_tree.yview)
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar = ttk.Scrollbar(list_frame, orient="horizontal", command=file_tree.xview)
+        xbar.grid(row=1, column=0, sticky="ew")
+        file_tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+
+        compact_path_map = {}
+
+        def compact_preview_context_active():
+            return case_browser_active_token is load_token and render_generation == file_render_generation["value"]
+
+        def compact_preview_path_provider(item_id):
+            return compact_path_map.get(item_id, "")
+
+        compact_preview_tooltip = LazyTreeviewThumbnailPreview(
+            file_tree,
+            compact_preview_path_provider,
+            compact_preview_context_active,
+        )
+        file_tree._compact_preview_tooltip = compact_preview_tooltip
+
+        def insert_compact_batch(start_index=0, batch_size=250):
+            if case_browser_active_token is not load_token or render_generation != file_render_generation["value"]:
+                return
+
+            end_index = min(len(files), start_index + batch_size)
+            for index in range(start_index, end_index):
+                path = files[index]
+                try:
+                    rel_path = os.path.relpath(path, folder_path)
+                except Exception:
+                    rel_path = path
+                item_id = file_tree.insert(
+                    "",
+                    "end",
+                    text=os.path.basename(path),
+                    values=(
+                        get_case_browser_file_type_label(path),
+                        get_case_browser_file_size(path),
+                        get_case_browser_modified_time(path),
+                        rel_path,
+                    ),
+                )
+                compact_path_map[item_id] = path
+
+            if end_index < len(files):
+                browser_status_var.set(f"{folder_path} - compact list rendering {end_index}/{len(files)} file(s)")
+                safe_after(1, insert_compact_batch, end_index, batch_size)
+            else:
+                browser_status_var.set(f"{folder_path} - compact list showing {len(files)} / {total_count} file(s)")
+
+        def get_selected_compact_path(event=None):
+            selection = file_tree.selection()
+            if not selection:
+                return ""
+            return compact_path_map.get(selection[0], "")
+
+        def open_compact_selection(event=None):
+            path = get_selected_compact_path(event)
+            if path:
+                open_selected_file(path)
+
+        def show_compact_context_menu(event):
+            item_id = file_tree.identify_row(event.y)
+            if item_id:
+                try:
+                    file_tree.selection_set(item_id)
+                    file_tree.focus(item_id)
+                except Exception:
+                    pass
+            path = get_selected_compact_path(event)
+            if path:
+                show_file_context_menu(event, path, folder_path)
+            return "break"
+
+        file_tree.bind("<Double-Button-1>", open_compact_selection)
+        file_tree.bind("<Button-3>", show_compact_context_menu)
+        file_tree.bind("<Button-2>", show_compact_context_menu)
+        insert_compact_batch()
+        configure_content()
+
+    def render_large_folder_summary(folder_path, files, total_count=None, search_query="", selected_filter="All"):
+        clear_content("summary")
+        total_count = len(files) if total_count is None else total_count
+        media_count = sum(1 for path in files if is_browser_media_file(path))
+        sidecar_count = max(0, len(files) - media_count)
+        browser_status_var.set(f"{folder_path} - large folder summary for {len(files)} / {total_count} file(s)")
+
+        content_frame.columnconfigure(0, weight=1)
+        summary = ttk.Frame(content_frame, padding=16)
+        summary.grid(row=0, column=0, sticky="nsew")
+        summary.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            summary,
+            text="Large folder detected",
+            font=("Segoe UI", 13, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        message = (
+            f"This folder has {len(files)} matching file(s) ({media_count} media, {sidecar_count} sidecar/text). "
+            "To keep the GUI responsive, the Case Browser does not render thousands of file cards automatically."
+        )
+        ttk.Label(summary, text=message, wraplength=900, justify="left").grid(row=1, column=0, sticky="ew", pady=(0, 12))
+
+        button_row = ttk.Frame(summary)
+        button_row.grid(row=2, column=0, sticky="w")
+        ttk.Button(
+            button_row,
+            text="Open Compact List",
+            command=lambda: (browser_view_mode_var.set("Compact"), render_compact_file_list(
+                folder_path,
+                files,
+                total_count=total_count,
+                search_query=search_query,
+                selected_filter=selected_filter,
+                note=f"Compact list mode is showing {len(files)} matching file(s) without loading card thumbnails.",
+            )),
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            button_row,
+            text=f"Show First {min(CASE_BROWSER_CARD_INITIAL_LIMIT, len(files))} Cards",
+            command=lambda: (browser_view_mode_var.set("Cards"), case_browser_card_limit_state.update({"key": None, "value": CASE_BROWSER_CARD_INITIAL_LIMIT}), render_file_cards(
+                folder_path,
+                files,
+                total_count=total_count,
+                search_query=search_query,
+                selected_filter=selected_filter,
+                force_cards=True,
+            )),
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(button_row, text="Open Folder", command=lambda: os.startfile(folder_path)).pack(side="left")
+        configure_content()
+
+    def render_file_cards(folder_path, files, total_count=None, search_query="", selected_filter="All", force_cards=False):
+        clear_content("cards")
+        render_generation = file_render_generation["value"]
+        total_count = len(files) if total_count is None else total_count
+
+        if not files:
+            case_browser_content_mode["value"] = "empty"
+            set_case_browser_outer_scrollbars(False)
+            try:
+                canvas.itemconfigure(content_window, width=max(1, canvas.winfo_width()), height=max(1, canvas.winfo_height()))
+            except Exception:
+                pass
+            browser_status_var.set(f"{folder_path} - 0 shown / {total_count} file(s)")
+            if str(search_query or "").strip():
+                message = "No files match the current Case Browser search/filter."
+            elif selected_filter != "All":
+                message = f"No files match the current Case Browser filter: {selected_filter}."
+            elif os.path.normcase(os.path.abspath(folder_path)) == os.path.normcase(os.path.abspath(output_root)):
+                message = "No captured case files found. Preview-only cache folders are hidden."
+            else:
+                message = "No media or sidecar files found in this folder."
+            ttk.Label(content_frame, text=message).grid(row=0, column=0, sticky="w", padx=12, pady=12)
+            return
+
+        view_mode = browser_view_mode_var.get() or "Auto"
+        if view_mode == "Compact" and not force_cards:
+            render_compact_file_list(folder_path, files, total_count=total_count, search_query=search_query, selected_filter=selected_filter)
+            return
+
+        if view_mode == "Auto" and len(files) >= CASE_BROWSER_HUGE_SUMMARY_THRESHOLD and not force_cards:
+            render_large_folder_summary(folder_path, files, total_count=total_count, search_query=search_query, selected_filter=selected_filter)
+            return
+
+        if view_mode == "Auto" and len(files) >= CASE_BROWSER_COMPACT_AUTO_THRESHOLD and not force_cards:
+            render_compact_file_list(
+                folder_path,
+                files,
+                total_count=total_count,
+                search_query=search_query,
+                selected_filter=selected_filter,
+                note=(
+                    f"Auto mode is using compact list mode for {len(files)} matching file(s). "
+                    "Use View > Cards only when you need visual thumbnails for a smaller subset."
+                ),
+            )
+            return
+
+        reset_case_browser_card_limit_if_context_changed(folder_path, files, search_query, selected_filter)
+        visible_limit = max(1, int(case_browser_card_limit_state.get("value") or CASE_BROWSER_CARD_INITIAL_LIMIT))
+        visible_files = list(files[:visible_limit])
+        hidden_count = max(0, len(files) - len(visible_files))
+        browser_status_var.set(f"{folder_path} - card view showing {len(visible_files)} / {len(files)} matching file(s)")
+
         geometry = get_browser_icon_geometry()
         columns = get_dynamic_browser_columns(geometry)
         case_browser_layout_columns["value"] = columns
@@ -16027,6 +17832,8 @@ def open_case_browser(select_tab=True, silent=False):
         card_entries = {}
         media_paths = []
         index_state = {"index": 0}
+        card_row_offset = 0
+        case_browser_card_rendering_state["value"] = True
 
         try:
             for column_index in range(max(1, columns + 1)):
@@ -16036,8 +17843,33 @@ def open_case_browser(select_tab=True, silent=False):
         except Exception:
             pass
 
+        if hidden_count:
+            card_row_offset = 1
+            limit_frame = ttk.Frame(content_frame, padding=(12, 10))
+            limit_frame.grid(row=0, column=0, columnspan=max(1, columns), sticky="ew", padx=10, pady=(10, 0))
+            limit_frame.columnconfigure(0, weight=1)
+            ttk.Label(
+                limit_frame,
+                text=f"Showing first {len(visible_files)} of {len(files)} matching file(s). Load more cards only when needed; compact list mode is faster for large folders.",
+                wraplength=900,
+                justify="left",
+            ).grid(row=0, column=0, sticky="ew")
+            button_row = ttk.Frame(limit_frame)
+            button_row.grid(row=1, column=0, sticky="w", pady=(8, 0))
+
+            def load_more_cards():
+                case_browser_card_limit_state["value"] = min(len(files), int(case_browser_card_limit_state.get("value") or CASE_BROWSER_CARD_INITIAL_LIMIT) + CASE_BROWSER_CARD_INITIAL_LIMIT)
+                render_file_cards(folder_path, files, total_count=total_count, search_query=search_query, selected_filter=selected_filter, force_cards=True)
+
+            ttk.Button(button_row, text=f"Load {min(CASE_BROWSER_CARD_INITIAL_LIMIT, hidden_count)} More", command=load_more_cards).pack(side="left", padx=(0, 8))
+            ttk.Button(
+                button_row,
+                text="Switch to Compact List",
+                command=lambda: (browser_view_mode_var.set("Compact"), render_compact_file_list(folder_path, files, total_count=total_count, search_query=search_query, selected_filter=selected_filter)),
+            ).pack(side="left")
+
         def create_file_card(index, path):
-            row = index // columns
+            row = (index // columns) + card_row_offset
             column = index % columns
 
             card = ttk.Frame(content_frame, padding=10, relief="ridge")
@@ -16070,16 +17902,20 @@ def open_case_browser(select_tab=True, silent=False):
             info_label = None
             rel_row = 2
             if is_browser_media_file(path):
+                if len(media_paths) < CASE_BROWSER_MAX_MEDIA_CARD_ASSETS:
+                    info_text = "Media info loading..."
+                    media_paths.append(path)
+                else:
+                    info_text = "Media info deferred"
                 info_label = ttk.Label(
                     card,
-                    text="Media info loading...",
+                    text=info_text,
                     wraplength=wrap,
                     justify="center",
                     anchor="center",
                 )
                 info_label.grid(row=2, column=0, sticky="ew")
                 rel_row = 3
-                media_paths.append(path)
 
             try:
                 rel_path = os.path.relpath(path, folder_path)
@@ -16114,22 +17950,28 @@ def open_case_browser(select_tab=True, silent=False):
 
         def render_next_card_batch():
             if case_browser_active_token is not load_token or render_generation != file_render_generation["value"]:
+                case_browser_card_rendering_state["value"] = False
                 return
 
             start_index = index_state["index"]
-            end_index = min(len(files), start_index + CASE_BROWSER_CARD_BATCH_SIZE)
+            end_index = min(len(visible_files), start_index + CASE_BROWSER_CARD_BATCH_SIZE)
 
             for index in range(start_index, end_index):
-                create_file_card(index, files[index])
+                create_file_card(index, visible_files[index])
 
             index_state["index"] = end_index
             configure_content()
+            safe_after(25, sync_case_browser_scrollregion)
 
-            if end_index < len(files):
-                browser_status_var.set(f"{folder_path} - rendering {end_index}/{len(files)} file card(s)")
-                root.after(1, render_next_card_batch)
+            if end_index < len(visible_files):
+                browser_status_var.set(f"{folder_path} - rendering {end_index}/{len(visible_files)} visible card(s)")
+                safe_after(20, render_next_card_batch)
             else:
-                browser_status_var.set(f"{folder_path} - {len(files)} file(s)")
+                case_browser_card_rendering_state["value"] = False
+                if hidden_count:
+                    browser_status_var.set(f"{folder_path} - card view showing {len(visible_files)} / {len(files)} matching file(s)")
+                else:
+                    browser_status_var.set(f"{folder_path} - {len(visible_files)} file(s)")
                 start_media_asset_worker()
 
         def update_media_card(path, media_info, thumb_path):
@@ -16156,7 +17998,10 @@ def open_case_browser(select_tab=True, silent=False):
                         if image.width() > thumb_w or image.height() > thumb_h:
                             factor = max(1, int(math.ceil(max(image.width() / thumb_w, image.height() / thumb_h))))
                             image = image.subsample(factor, factor)
+                        entry["image_ref"] = image
                         image_refs.append(image)
+                        if len(image_refs) > CASE_BROWSER_PHOTOIMAGE_REF_LIMIT:
+                            del image_refs[:len(image_refs) - CASE_BROWSER_PHOTOIMAGE_REF_LIMIT]
                         thumb.delete("all")
                         thumb.create_image(thumb_w // 2, thumb_h // 2, image=image, anchor="center")
                     except Exception:
@@ -16174,28 +18019,67 @@ def open_case_browser(select_tab=True, silent=False):
 
             ffprobe_exe = get_ffprobe_executable_for_gui()
             ffmpeg_exe = get_ffmpeg_executable_for_gui()
+            probe_queue = queue.Queue()
 
-            def worker():
-                for path in list(media_paths):
-                    if case_browser_active_token is not load_token:
+            for path in list(media_paths):
+                probe_queue.put(path)
+
+            worker_count = min(CASE_BROWSER_MEDIA_PROBE_CONCURRENCY, probe_queue.qsize())
+
+            def worker(worker_index):
+                while not APP_CLOSING and case_browser_active_token is load_token and render_generation == file_render_generation["value"]:
+                    try:
+                        path = probe_queue.get_nowait()
+                    except queue.Empty:
+                        return
+                    except Exception as e:
+                        log_debug_exception("Case Browser media probe queue failed", e)
                         return
 
+                    acquired = False
                     try:
-                        media_info = load_or_generate_media_info_with_exe(path, ffprobe_exe) if is_browser_media_file(path) else {}
-                    except Exception:
-                        media_info = {}
+                        case_browser_media_probe_semaphore.acquire()
+                        acquired = True
 
-                    try:
-                        thumb_path = generate_case_browser_thumbnail_with_exe(path, ffmpeg_exe)
-                    except Exception:
-                        thumb_path = ""
+                        if APP_CLOSING or case_browser_active_token is not load_token or render_generation != file_render_generation["value"]:
+                            return
 
-                    def apply_result(p=path, info=media_info, thumbnail=thumb_path):
-                        update_media_card(p, info, thumbnail)
+                        try:
+                            media_info = load_or_generate_media_info_with_exe(path, ffprobe_exe) if is_browser_media_file(path) else {}
+                        except Exception as e:
+                            log_debug_exception(f"Case Browser media info failed: {path}", e)
+                            media_info = {}
 
-                    enqueue_case_browser_ui(apply_result)
+                        if APP_CLOSING or case_browser_active_token is not load_token or render_generation != file_render_generation["value"]:
+                            return
 
-            threading.Thread(target=worker, daemon=True).start()
+                        try:
+                            thumb_path = generate_case_browser_thumbnail_with_exe(path, ffmpeg_exe)
+                        except Exception as e:
+                            log_debug_exception(f"Case Browser thumbnail generation failed: {path}", e)
+                            thumb_path = ""
+
+                        if APP_CLOSING or case_browser_active_token is not load_token or render_generation != file_render_generation["value"]:
+                            return
+
+                        def apply_result(p=path, info=media_info, thumbnail=thumb_path):
+                            update_media_card(p, info, thumbnail)
+
+                        enqueue_case_browser_ui(apply_result)
+
+                    finally:
+                        if acquired:
+                            try:
+                                case_browser_media_probe_semaphore.release()
+                            except Exception as e:
+                                log_debug_exception("Case Browser media probe semaphore release failed", e)
+                        try:
+                            probe_queue.task_done()
+                        except Exception:
+                            pass
+
+            for worker_index in range(worker_count):
+                start_daemon_thread(f"case_browser_media_probe_{worker_index + 1}", worker, worker_index)
 
         render_next_card_batch()
 
@@ -16207,14 +18091,13 @@ def open_case_browser(select_tab=True, silent=False):
             ttk.Label(content_frame, text="Selected folder is missing or invalid.").grid(row=0, column=0, sticky="w", padx=12, pady=12)
             return
 
-        file_render_generation["value"] += 1
-        generation = file_render_generation["value"]
         selected_filter = browser_filter_var.get()
         current_only = bool(browser_current_only_var.get())
         sort_mode = browser_sort_var.get()
         search_query = browser_search_var.get()
 
-        clear_content()
+        clear_content("empty")
+        generation = file_render_generation["value"]
         browser_status_var.set(f"Loading files from: {folder_path}")
         ttk.Label(content_frame, text="Loading files...").grid(row=0, column=0, sticky="w", padx=12, pady=12)
 
@@ -16240,7 +18123,7 @@ def open_case_browser(select_tab=True, silent=False):
 
             enqueue_case_browser_ui(apply_result)
 
-        threading.Thread(target=worker, daemon=True).start()
+        start_daemon_thread("worker", worker)
 
 
     def on_tree_select(event=None):
@@ -16335,82 +18218,125 @@ def open_case_browser(select_tab=True, silent=False):
             )
             return
 
-        manifest_path = find_latest_manifest(case_root)
-
-        if not manifest_path:
-            messagebox.showwarning(
-                "No manifest found",
-                f"No SHA256 manifest was found for:\n\n{case_root}",
-            )
-            return
-
-        ok_count = 0
-        missing = []
-        changed = []
-        manifest_paths = set()
-
         try:
-            with open(manifest_path, "r", encoding="utf-8-sig", newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    path = row.get("Path", "")
-                    expected_hash = (row.get("Hash", "") or "").upper()
+            verify_button.configure(state="disabled")
+        except Exception:
+            pass
 
-                    if not path:
-                        continue
+        browser_status_var.set(f"Verifying case files for: {case_root}")
+        queue_append_log(f"\nCase file verification started for:\n{case_root}\n")
 
-                    abs_path = os.path.abspath(path)
+        def worker():
+            summary = ""
+            error = ""
+            warning_title = ""
+            warning_message = ""
 
-                    if is_case_verification_ignored_path(abs_path):
-                        continue
+            try:
+                manifest_path = find_latest_manifest(case_root)
 
-                    manifest_paths.add(abs_path)
+                if not manifest_path:
+                    warning_title = "No manifest found"
+                    warning_message = f"No SHA256 manifest was found for:\n\n{case_root}"
+                else:
+                    ok_count = 0
+                    missing = []
+                    changed = []
+                    manifest_paths = set()
 
-                    if not os.path.isfile(abs_path):
-                        missing.append(path)
-                        continue
+                    with open(manifest_path, "r", encoding="utf-8-sig", newline="") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            if case_browser_active_token is not load_token or APP_CLOSING:
+                                return
 
-                    try:
-                        h = hashlib.sha256()
-                        with open(abs_path, "rb") as input_file_obj:
-                            for chunk in iter(lambda: input_file_obj.read(1024 * 1024), b""):
-                                h.update(chunk)
-                        actual_hash = h.hexdigest().upper()
-                    except Exception:
-                        changed.append(path)
-                        continue
+                            path = row.get("Path", "")
+                            expected_hash = (row.get("Hash", "") or "").upper()
 
-                    if actual_hash == expected_hash:
-                        ok_count += 1
-                    else:
-                        changed.append(path)
+                            if not path:
+                                continue
 
-            untracked_count = 0
-            for root_dir, dir_names, file_names in os.walk(case_root):
-                dir_names[:] = [name for name in dir_names if name.lower() not in {"__pycache__", ".gui-cache", "manifests"}]
-                for file_name in file_names:
-                    path = os.path.abspath(os.path.join(root_dir, file_name))
-                    if is_case_verification_ignored_path(path):
-                        continue
-                    if path == os.path.abspath(manifest_path):
-                        continue
-                    if path not in manifest_paths:
-                        untracked_count += 1
+                            abs_path = os.path.abspath(path)
 
-            summary = (
-                f"Manifest:\n{manifest_path}\n\n"
-                f"Verified unchanged: {ok_count}\n"
-                f"Missing: {len(missing)}\n"
-                f"Changed/unreadable: {len(changed)}\n"
-                f"New/untracked since manifest: {untracked_count}\n"
-                f"Ignored folders: .gui-cache, manifests\n"
-            )
+                            if is_case_verification_ignored_path(abs_path):
+                                continue
 
-            append_log("\nCase file verification:\n" + summary + "\n")
-            messagebox.showinfo("Case file verification", summary)
+                            manifest_paths.add(abs_path)
 
-        except Exception as e:
-            messagebox.showerror("Verification failed", f"Could not verify case files:\n\n{e}")
+                            if not os.path.isfile(abs_path):
+                                missing.append(path)
+                                continue
+
+                            try:
+                                h = hashlib.sha256()
+                                with open(abs_path, "rb") as input_file_obj:
+                                    for chunk in iter(lambda: input_file_obj.read(1024 * 1024), b""):
+                                        if case_browser_active_token is not load_token or APP_CLOSING:
+                                            return
+                                        h.update(chunk)
+                                actual_hash = h.hexdigest().upper()
+                            except Exception:
+                                changed.append(path)
+                                continue
+
+                            if actual_hash == expected_hash:
+                                ok_count += 1
+                            else:
+                                changed.append(path)
+
+                    untracked_count = 0
+                    for root_dir, dir_names, file_names in os.walk(case_root):
+                        if case_browser_active_token is not load_token or APP_CLOSING:
+                            return
+
+                        dir_names[:] = [name for name in dir_names if name.lower() not in {"__pycache__", ".gui-cache", "manifests"}]
+                        for file_name in file_names:
+                            path = os.path.abspath(os.path.join(root_dir, file_name))
+                            if is_case_verification_ignored_path(path):
+                                continue
+                            if path == os.path.abspath(manifest_path):
+                                continue
+                            if path not in manifest_paths:
+                                untracked_count += 1
+
+                    summary = (
+                        f"Manifest:\n{manifest_path}\n\n"
+                        f"Verified unchanged: {ok_count}\n"
+                        f"Missing: {len(missing)}\n"
+                        f"Changed/unreadable: {len(changed)}\n"
+                        f"New/untracked since manifest: {untracked_count}\n"
+                        f"Ignored folders: .gui-cache, manifests\n"
+                    )
+
+            except Exception as e:
+                error = str(e)
+
+            def apply_result():
+                if case_browser_active_token is not load_token:
+                    return
+
+                try:
+                    verify_button.configure(state="normal")
+                except Exception:
+                    pass
+
+                if warning_message:
+                    browser_status_var.set(f"Verification skipped for: {case_root}")
+                    messagebox.showwarning(warning_title, warning_message)
+                    return
+
+                if error:
+                    browser_status_var.set(f"Verification failed for: {case_root}")
+                    messagebox.showerror("Verification failed", f"Could not verify case files:\n\n{error}")
+                    return
+
+                browser_status_var.set(f"Verification completed for: {case_root}")
+                queue_append_log("\nCase file verification:\n" + summary + "\n")
+                messagebox.showinfo("Case file verification", summary)
+
+            enqueue_case_browser_ui(apply_result)
+
+        start_daemon_thread("worker", worker)
 
     def find_tree_item_by_path(target_path):
         try:
@@ -16486,15 +18412,17 @@ def open_case_browser(select_tab=True, silent=False):
 
             enqueue_case_browser_ui(apply_result)
 
-        threading.Thread(target=worker, daemon=True).start()
+        start_daemon_thread("worker", worker)
 
     tree.bind("<<TreeviewSelect>>", on_tree_select)
     filter_menu.bind("<<ComboboxSelected>>", lambda event: refresh_browser_view())
     sort_menu.bind("<<ComboboxSelected>>", lambda event: refresh_browser_view())
-    scale_menu.bind("<<ComboboxSelected>>", lambda event: (case_browser_layout_columns.update({"value": 0}), refresh_browser_view()))
+    view_menu.bind("<<ComboboxSelected>>", lambda event: (case_browser_card_limit_state.update({"key": None, "value": CASE_BROWSER_CARD_INITIAL_LIMIT}), refresh_browser_view()))
+    scale_menu.bind("<<ComboboxSelected>>", lambda event: (case_browser_layout_columns.update({"value": 0}), case_browser_card_limit_state.update({"key": None, "value": CASE_BROWSER_CARD_INITIAL_LIMIT}), refresh_browser_view()))
 
     ttk.Button(top_bar, text="Refresh", command=refresh_tree).pack(side="right", padx=(6, 0))
-    ttk.Button(top_bar, text="Verify Case Files", command=verify_case_files).pack(side="right", padx=(6, 0))
+    verify_button = ttk.Button(top_bar, text="Verify Case Files", command=verify_case_files)
+    verify_button.pack(side="right", padx=(6, 0))
     ttk.Button(top_bar, text="Open Folder", command=open_selected_browser_folder).pack(side="right", padx=(6, 0))
     ttk.Button(top_bar, text="Open Output Root", command=lambda: os.startfile(output_root)).pack(side="right", padx=(6, 0))
 
@@ -16502,54 +18430,110 @@ def open_case_browser(select_tab=True, silent=False):
 
 
 def on_close():
-    if job_queue_running:
+    global APP_CLOSING, SHUTDOWN_STARTED, job_queue_pause_after_current
+
+    if SHUTDOWN_STARTED:
+        return
+
+    queue_active = False
+    direct_av_active = False
+    direct_image_active = False
+
+    try:
+        queue_active = bool(job_queue_running or any(process is not None and process.poll() is None for process in job_queue_running_processes.values()))
+    except Exception as e:
+        log_debug_exception("Could not determine queue active state during shutdown", e)
+        queue_active = bool(job_queue_running)
+
+    try:
+        direct_av_active = bool(running_process is not None and running_process.poll() is None)
+    except Exception as e:
+        log_debug_exception("Could not determine Audio/Video direct process state during shutdown", e)
+        direct_av_active = False
+
+    try:
+        direct_image_active = bool(image_running_process is not None and image_running_process.poll() is None)
+    except Exception as e:
+        log_debug_exception("Could not determine Image direct process state during shutdown", e)
+        direct_image_active = False
+
+    if queue_active:
         if not messagebox.askyesno(
             "Job queue running",
-            "The job queue is still running. Stop the current job and exit?",
+            "The job queue is still running. Stop active queue process tree(s), save interrupted jobs, and exit?",
         ):
             return
 
-        for job in get_running_queue_jobs():
-            job["_interruption_requested"] = True
-            job["interrupted_reason"] = "App closed while job was running."
-        stop_capture()
-        mark_running_queue_jobs_interrupted("App closed while job was running.")
+    if direct_av_active or direct_image_active:
+        if not messagebox.askyesno(
+            "Capture running",
+            "A direct capture is still running. Stop active process tree(s), save interrupted recovery jobs where available, and exit?",
+        ):
+            return
+
+    SHUTDOWN_STARTED = True
+    APP_CLOSING = True
+
+    try:
+        disable_start_controls_for_shutdown()
+        root.configure(cursor="watch")
+        root.update_idletasks()
+    except Exception as e:
+        log_debug_exception("Could not update UI for shutdown", e)
+
+    if queue_active:
+        try:
+            job_queue_pause_after_current = True
+            for job in get_running_queue_jobs():
+                job["_interruption_requested"] = True
+                job["interrupted_reason"] = "App closed while job was running."
+            for job_id, process in list(job_queue_running_processes.items()):
+                terminate_process_tree(process, label=f"queue job {job_id}")
+            mark_running_queue_jobs_interrupted("App closed while job was running.")
+        except Exception as e:
+            log_debug_exception("Queue shutdown handling failed", e)
+
+    if direct_av_active or direct_image_active:
+        try:
+            mark_running_queue_jobs_interrupted("App closed while direct capture was running.")
+        except Exception as e:
+            log_debug_exception("Could not mark direct capture jobs interrupted during shutdown", e)
+
+        if direct_av_active:
+            terminate_process_tree(running_process, label="direct Audio/Video capture")
+
+        if direct_image_active:
+            terminate_process_tree(image_running_process, label="direct Image Capture")
+
+    try:
+        flush_log_queues_now()
+    except Exception as e:
+        log_debug_exception("Could not flush log queues during shutdown", e)
 
     try:
         save_url_box_persistence_if_enabled()
         save_image_url_box_persistence_if_enabled()
-        save_settings(show_popup=False)
-        save_job_queue_state()
-    except Exception:
-        pass
+        flush_settings_autosave()
+        flush_job_queue_state_save()
+        save_settings(show_popup=False, log_saved=False)
+        save_job_queue_state(immediate=True)
+    except Exception as e:
+        log_debug_exception("Final state save during shutdown failed", e)
 
-    active_image_process = False
     try:
-        active_image_process = image_running_process is not None and image_running_process.poll() is None
-    except Exception:
-        active_image_process = False
+        cleanup_tracked_gui_temp_files()
+    except Exception as e:
+        log_debug_exception("Temp cleanup during shutdown failed", e)
 
-    if (running_process is not None and running_process.poll() is None) or active_image_process:
-        if not messagebox.askyesno("Capture running", "A capture is still running. Stop it and exit?"):
-            return
+    try:
+        delete_selected_cookies_file_on_exit()
+    except Exception as e:
+        log_debug_exception("Delete cookies on exit failed during shutdown", e)
 
-        mark_running_queue_jobs_interrupted("App closed while direct capture was running.")
-        try:
-            if running_process is not None and running_process.poll() is None:
-                running_process.terminate()
-        except Exception:
-            pass
-        try:
-            if active_image_process:
-                image_running_process.terminate()
-        except Exception:
-            pass
-
-    cleanup_tracked_gui_temp_files()
-
-    delete_selected_cookies_file_on_exit()
-
-    root.destroy()
+    try:
+        root.destroy()
+    except Exception as e:
+        log_debug_exception("Root destroy failed during shutdown", e)
 
 
 def apply_screen_aware_startup_geometry():
@@ -16582,6 +18566,7 @@ except Exception:
     ORIGINAL_TTK_THEME = ""
 root.title(f"{APP_TITLE} - Profile: {DEFAULT_PROFILE_NAME}")
 apply_screen_aware_startup_geometry()
+install_global_scroll_recognition(root)
 
 script_path_var = tk.StringVar(value=DEFAULTS["script_path"])
 yt_dlp_path_var = tk.StringVar(value=DEFAULTS["yt_dlp_path"])
@@ -17291,7 +19276,7 @@ vpn_adapter_menu = ttk.Combobox(
     state="readonly",
 )
 vpn_adapter_menu.grid(row=0, column=1, sticky="ew", padx=(0, 8))
-vpn_adapter_menu.bind("<<ComboboxSelected>>", lambda event: save_settings(show_popup=False))
+vpn_adapter_menu.bind("<<ComboboxSelected>>", lambda event: schedule_settings_autosave())
 vpn_adapter_menus.append(vpn_adapter_menu)
 
 ttk.Button(
@@ -17487,8 +19472,7 @@ image_url_all_view_cache = []
 
 def image_append_log(text):
     try:
-        image_log_box.insert("end", text)
-        image_log_box.see("end")
+        append_to_log_widget(image_log_box, text)
     except Exception:
         append_log(text)
 
@@ -17501,42 +19485,28 @@ def image_set_status(text):
 
 
 def parse_image_input_file_paths(value=None):
-    raw = image_input_file_var.get() if value is None else value
-    raw = str(raw or "").strip()
-    if not raw:
-        return []
-    return [part.strip().strip('"') for part in re.split(r"[;\n]+", raw) if part.strip()]
+    return parse_delimited_file_paths(image_input_file_var.get() if value is None else value)
 
 
 def get_existing_image_input_file_paths(value=None):
-    return [path for path in parse_image_input_file_paths(value) if os.path.isfile(path)]
+    return existing_file_paths(parse_image_input_file_paths(value))
 
 
 def get_image_url_source_text():
-    pasted = image_urls_text.get("1.0", "end").strip()
-    if pasted:
-        return pasted
-    paths = get_existing_image_input_file_paths()
-    if paths:
-        return "\n".join(read_text_file_best_effort(path, log_errors=True) for path in paths)
-    return ""
+    return get_url_source_text_from_widget(
+        image_urls_text,
+        get_existing_image_input_file_paths(),
+        normalize_files=False,
+        log_errors=True,
+    )
 
 
 def get_image_url_list():
-    pasted = image_urls_text.get("1.0", "end").strip()
-    pasted_urls = extract_urls_from_text(pasted)
-    if pasted_urls:
-        return pasted_urls
-    urls = []
-    for path in get_existing_image_input_file_paths():
-        urls.extend(extract_urls_from_text(read_text_file_best_effort(path, log_errors=True)))
-    return urls
+    return get_url_list_from_widget(image_urls_text, get_existing_image_input_file_paths(), log_errors=True)
 
 
 def set_image_url_box_urls(urls):
-    image_urls_text.delete("1.0", "end")
-    if urls:
-        image_urls_text.insert("1.0", "\n".join(urls).strip())
+    set_text_widget_url_lines(image_urls_text, urls)
 
 
 def load_image_urls_from_input_file(replace=True):
@@ -17544,9 +19514,7 @@ def load_image_urls_from_input_file(replace=True):
     if not paths:
         messagebox.showwarning("Input File(s)", "No valid Image Capture Input File(s) were selected.")
         return
-    urls = []
-    for path in paths:
-        urls.extend(extract_urls_from_text(read_text_file_best_effort(path, log_errors=True)))
+    urls = read_urls_from_input_paths(paths, log_errors=True)
     if replace:
         set_image_url_box_urls(urls)
         image_append_log(f"\nLoaded {len(urls)} image URL(s) from Input File(s).\n")
@@ -17583,36 +19551,21 @@ def clear_image_urls():
 
 
 def strip_image_url_extra_ampersand_tags():
-    content = image_urls_text.get("1.0", "end").strip()
+    content = get_text_widget_content(image_urls_text, "end", strip=True)
     if not content:
         messagebox.showwarning("No URLs", "The Image Capture URL box is empty.")
         return
-    output_lines = []
-    changed = 0
-    parameter_pattern = re.compile(r"&[A-Za-z][A-Za-z0-9_-]*=")
-    for line in content.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            output_lines.append(line)
-            continue
-        decoded = html.unescape(stripped)
-        match = parameter_pattern.search(decoded)
-        new_url = decoded[:match.start()] if match else decoded
-        if new_url != stripped:
-            changed += 1
-        output_lines.append(new_url)
-    set_image_url_box_urls(output_lines)
+    output_text, changed = strip_parameter_like_ampersand_tags_from_text(content)
+    replace_text_widget_content(image_urls_text, output_text)
     image_append_log(f"\nStripped parameter-like ampersand tags from {changed} Image Capture URL(s).\n")
 
 
 def copy_image_urls_from_box():
-    value = image_urls_text.get("1.0", "end-1c")
+    value = get_text_widget_content(image_urls_text, "end-1c", strip=False)
     if not value.strip():
         messagebox.showwarning("No URLs", "The Image Capture URL box is empty.")
         return
-    root.clipboard_clear()
-    root.clipboard_append(value)
-    image_append_log("\nImage Capture URL box copied to clipboard.\n")
+    copy_text_to_clipboard(value, label="Image Capture URL box", log_func=image_append_log)
 
 
 def get_image_gui_failed_urls_path():
@@ -17670,21 +19623,8 @@ def group_image_urls_by_tld():
     if not urls:
         messagebox.showwarning("No URLs", "No Image Capture URLs are available to group.")
         return
-    groups = {}
-    order = []
-    for url in urls:
-        domain = get_url_domain_key(url) or "unknown"
-        if domain not in groups:
-            groups[domain] = []
-            order.append(domain)
-        groups[domain].append(url)
-    output = []
-    for domain in sorted(order):
-        output.append(f"# {domain}")
-        output.extend(groups[domain])
-        output.append("")
-    image_urls_text.delete("1.0", "end")
-    image_urls_text.insert("1.0", "\n".join(output).strip())
+    output_lines, groups = group_urls_by_domain_lines(urls)
+    replace_text_widget_content(image_urls_text, "\n".join(output_lines).strip())
     image_append_log(f"\nGrouped {len(urls)} Image Capture URL(s) by {len(groups)} domain(s).\n")
 
 
@@ -17693,30 +19633,19 @@ def show_image_url_statistics():
     if not urls:
         messagebox.showinfo("URL Statistics", "No Image Capture URLs found.")
         return
-    counts = {}
-    for url in urls:
-        domain = get_url_domain_key(url) or "unknown"
-        counts[domain] = counts.get(domain, 0) + 1
-    lines = [f"Total URLs: {len(urls)}", f"Unique URLs: {len({normalize_url_for_compare(u) for u in urls})}", f"Domains: {len(counts)}", "", "Total by domain:"]
-    lines.extend(f"  {domain}: {count}" for domain, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+    lines, _counts = build_url_statistics_lines(urls)
     messagebox.showinfo("Image Capture URL Statistics", "\n".join(lines))
 
 
 def remove_duplicate_image_urls_from_box():
-    urls = extract_urls_from_text(get_image_url_source_text())
-    output = []
-    seen = set()
-    duplicate_count = 0
-    for url in urls:
-        normalized = normalize_url_for_compare(url)
-        if normalized in seen:
-            duplicate_count += 1
-            continue
-        seen.add(normalized)
-        output.append(clean_extracted_url(url))
-    set_image_url_box_urls(output)
-    messagebox.showinfo("Duplicates Removed", f"Unique URLs kept: {len(output)}\nDuplicates removed: {duplicate_count}")
-    image_append_log(f"\nRemoved {duplicate_count} duplicate Image Capture URL(s); kept {len(output)} unique URL(s).\n")
+    source_text = get_image_url_source_text()
+    if not source_text.strip():
+        messagebox.showwarning("No URLs", "No Image Capture URL text or input file contents were found.")
+        return
+    output_urls, duplicate_count = deduplicate_urls_from_source_text(source_text)
+    set_image_url_box_urls(output_urls)
+    messagebox.showinfo("Duplicates Removed", f"Unique URLs kept: {len(output_urls)}\nDuplicates removed: {duplicate_count}")
+    image_append_log(f"\nRemoved {duplicate_count} duplicate Image Capture URL(s); kept {len(output_urls)} unique URL(s).\n")
 
 
 def validate_image_urls_in_box(normalize=False):
@@ -18101,6 +20030,7 @@ def add_image_urls_to_queue_as_job(urls=None):
             "domains": domains,
             "allow_domain_collision": False,
             "checked": False,
+            "direct_capture": False,
         }
 
         collisions = find_domain_collisions_for_job(job)
@@ -18111,6 +20041,7 @@ def add_image_urls_to_queue_as_job(urls=None):
             mark_job_domain_policy(job, choice)
 
         job_queue.append(job)
+        save_job_queue_state()
         refresh_job_queue_window()
         image_append_log(f"\nAdded Image Capture queue job: {resolved_case_name} ({len(clean_urls)} URL(s))\n")
         if applied_presets:
@@ -18226,7 +20157,7 @@ def start_image_capture():
                     start_job_queue()
                 cleanup_command_input_file_if_temp(cmd)
                 return
-        save_settings(show_popup=False)
+        schedule_settings_autosave()
     except Exception as e:
         cleanup_command_input_file_if_temp(cmd)
         messagebox.showerror("Image Capture input error", str(e))
@@ -18293,13 +20224,13 @@ def start_image_capture():
             image_running_process = process
             if process.stdout:
                 for line in process.stdout:
-                    root.after(0, image_append_log, line)
+                    queue_image_append_log(line)
                     if direct_recovery_job_id and (line.startswith("GUI_QUEUE_URL_COMPLETE	") or line.startswith("GUI_QUEUE_URL_INCOMPLETE	")):
-                        root.after(0, handle_queue_output_line, direct_recovery_job_id, line)
+                        safe_after(0, handle_queue_output_line, direct_recovery_job_id, line)
             exit_code = process.wait()
-            root.after(0, finish_direct_recovery_job, direct_recovery_job_id, exit_code)
+            safe_after(0, finish_direct_recovery_job, direct_recovery_job_id, exit_code)
         except Exception as e:
-            root.after(0, image_append_log, f"\nERROR: {e}\n")
+            queue_image_append_log(f"\nERROR: {e}\n")
             exit_code = 1
         finally:
             cleanup_command_input_file_if_temp(cmd)
@@ -18314,17 +20245,17 @@ def start_image_capture():
             image_stop_button.config(state="disabled")
             image_set_status("Complete" if exit_code == 0 else "Failed")
             image_append_log(f"\nImage Capture finished with exit code {exit_code}.\n")
-        root.after(0, finish)
+        safe_after(0, finish)
 
-    threading.Thread(target=worker, daemon=True).start()
+    start_daemon_thread("worker", worker)
 
 def stop_image_capture():
     global image_running_process
     if image_running_process is not None and image_running_process.poll() is None:
         try:
             mark_running_queue_jobs_interrupted("Stopped by user.")
-            image_running_process.terminate()
-            image_append_log("\nStop requested for Image Capture.\n")
+            terminate_process_tree(image_running_process, label="direct Image Capture")
+            image_append_log("\nStop requested for Image Capture process tree.\n")
         except Exception as e:
             image_append_log(f"\nStop failed: {e}\n")
     image_stop_button.config(state="disabled")
@@ -18428,7 +20359,7 @@ def hide_image_capture_options_panel(save=False):
 
     if save:
         update_image_options_summary()
-        save_settings(show_popup=False)
+        schedule_settings_autosave()
 
 
 def hide_image_advanced_options_panel(save=False):
@@ -18445,7 +20376,7 @@ def hide_image_advanced_options_panel(save=False):
 
     if save:
         update_image_options_summary()
-        save_settings(show_popup=False)
+        schedule_settings_autosave()
 
 
 def toggle_image_capture_options_panel():
@@ -18601,7 +20532,7 @@ def build_image_capture_tab():
     image_cookies_file_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
     image_cookies_file_browse_button = ttk.Button(cookies_frame, text="Browse...", command=lambda: browse_file(image_cookies_file_var, "Image Capture Cookies File"))
     image_cookies_file_browse_button.grid(row=0, column=1, sticky="e", padx=(0, 6))
-    ttk.Checkbutton(cookies_frame, text="Use", variable=image_use_cookies_file_var, command=lambda: (update_image_cookies_file_control_state(), save_settings(show_popup=False))).grid(row=0, column=2, sticky="e")
+    ttk.Checkbutton(cookies_frame, text="Use", variable=image_use_cookies_file_var, command=lambda: (update_image_cookies_file_control_state(), schedule_settings_autosave())).grid(row=0, column=2, sticky="e")
 
     add_image_file_row(image_capture_tab, 6, "Output Root", image_output_root_var)
 
@@ -18645,7 +20576,7 @@ def build_image_capture_tab():
         state="readonly",
     )
     image_vpn_adapter_menu.grid(row=0, column=1, sticky="ew", padx=(0, 8))
-    image_vpn_adapter_menu.bind("<<ComboboxSelected>>", lambda event: save_settings(show_popup=False))
+    image_vpn_adapter_menu.bind("<<ComboboxSelected>>", lambda event: schedule_settings_autosave())
     vpn_adapter_menus.append(image_vpn_adapter_menu)
 
     ttk.Button(
@@ -19656,12 +21587,13 @@ start_case_browser_result_poller()
 schedule_case_browser_autoload(delay_ms=400)
 schedule_playlist_preview_autoload(delay_ms=500)
 apply_app_theme()
+install_global_scroll_recognition(root)
 update_window_title()
 if check_vpn_var.get():
-    root.after(300, refresh_network_adapters)
+    safe_after(300, refresh_network_adapters)
 else:
     vpn_status_var.set("VPN: Check disabled")
 
-root.after(150, deferred_job_queue_startup)
+safe_after(150, deferred_job_queue_startup)
 
 root.mainloop()
